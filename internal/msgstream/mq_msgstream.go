@@ -512,8 +512,9 @@ func NewMqTtMsgStream(ctx context.Context,
 }
 
 func (ms *MqTtMsgStream) addConsumer(consumer mqclient.Consumer, channel string) {
+	startConsumer := false
 	if len(ms.consumers) == 0 {
-		ms.syncConsumer <- 1
+		startConsumer = true
 	}
 	ms.consumers[channel] = consumer
 	ms.consumerChannels = append(ms.consumerChannels, channel)
@@ -525,6 +526,9 @@ func (ms *MqTtMsgStream) addConsumer(consumer mqclient.Consumer, channel string)
 	}
 	ms.chanStopChan[consumer] = make(chan bool)
 	ms.chanTtMsgTime[consumer] = 0
+	if startConsumer {
+		ms.syncConsumer <- 1
+	}
 }
 
 // AsConsumer subscribes channels as consumer for a MsgStream
@@ -607,6 +611,7 @@ func (ms *MqTtMsgStream) bufMsgPackToChannel() {
 
 			// wait all channels get ttMsg
 			for _, consumer := range ms.consumers {
+				// if some of the channels are already ahead of timetick, skip consume. this is marked in func allChanReachSameTtMsg
 				if !chanTtMsgSync[consumer] {
 					ms.chanWaitGroup.Add(1)
 					go ms.consumeToTtMsg(consumer)
@@ -617,7 +622,6 @@ func (ms *MqTtMsgStream) bufMsgPackToChannel() {
 			// block here until all channels reach same timetick
 			currTs, ok := ms.allChanReachSameTtMsg(chanTtMsgSync)
 			if !ok || currTs <= ms.lastTimeStamp {
-				//log.Printf("All timeTick's timestamps are inconsistent")
 				ms.consumerLock.Unlock()
 				continue
 			}
@@ -679,7 +683,6 @@ func (ms *MqTtMsgStream) bufMsgPackToChannel() {
 				StartPositions: startMsgPosition,
 				EndPositions:   endMsgPositions,
 			}
-
 			//log.Debug("send msg pack", zap.Int("len", len(msgPack.Msgs)), zap.Uint64("currTs", currTs))
 			ms.receiveBuf <- &msgPack
 			ms.lastTimeStamp = currTs

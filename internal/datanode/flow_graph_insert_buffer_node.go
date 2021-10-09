@@ -138,7 +138,6 @@ func (ibNode *insertBufferNode) Close() {
 
 func (ibNode *insertBufferNode) Operate(in []Msg) []Msg {
 	// log.Debug("InsertBufferNode Operating")
-
 	if len(in) != 1 {
 		log.Error("Invalid operate message input in insertBufferNode", zap.Int("input length", len(in)))
 		return []Msg{}
