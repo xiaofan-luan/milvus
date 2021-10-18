@@ -12,3 +12,17 @@ The following scripts and commands may be used during segcore development
         - if license info is added
         - if `cpplint.py` standard meets , might need to be fixed by hand
     - `make verifier` also include functions in `make cppcheck`
+
+## code compilation
+- under milvus/internal/core folder
+    - use `./build.sh -u -t Debug -o cmake-build-debug`
+        - compile with unittest (`-u`)
+        - compile with Debug mode (`-t Debug`)
+        - output to cmake-build-debug directory (`-o cmake-build-debug`)
+- You can also use clion to open the core folder, and setup compilation environment
+    - Need to modify `CMake Options`, keep with the parameters consistent with the first line output './build.sh'
+    
+- After compilation, the following executable files deserves attention
+    - ${build}/unittest/all_tests: GTest format test program，including all tests, can use `--gtest_filter=` to filter the required tests
+    - ${build}/bench/all_bench: performance benchmark，based on Google Benchmark. 
+  
