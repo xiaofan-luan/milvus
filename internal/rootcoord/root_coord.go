@@ -931,8 +931,12 @@ func (c *Core) Register() error {
 	return nil
 }
 
+func (c *Core) SetEtcdClient(etcdClient *clientv3.Client) {
+	c.etcdCli = etcdClient
+}
+
 func (c *Core) initSession() error {
-	c.session = sessionutil.NewSession(c.ctx, Params.RootCoordCfg.MetaRootPath, Params.RootCoordCfg.EtcdEndpoints)
+	c.session = sessionutil.NewSession(c.ctx, Params.RootCoordCfg.MetaRootPath, c.etcdCli)
 	if c.session == nil {
 		return fmt.Errorf("session is nil, the etcd client connection may have failed")
 	}
@@ -946,7 +950,7 @@ func (c *Core) Init() error {
 	var initError error
 	if c.kvBaseCreate == nil {
 		c.kvBaseCreate = func(root string) (kv.TxnKV, error) {
-			return etcdkv.NewEtcdKV(Params.RootCoordCfg.EtcdEndpoints, root)
+			return etcdkv.NewEtcdKV(c.etcdCli, root), nil
 		}
 	}
 	c.initOnce.Do(func() {
@@ -956,10 +960,6 @@ func (c *Core) Init() error {
 			return
 		}
 		connectEtcdFn := func() error {
-			if c.etcdCli, initError = clientv3.New(clientv3.Config{Endpoints: Params.RootCoordCfg.EtcdEndpoints, DialTimeout: 5 * time.Second}); initError != nil {
-				log.Error("RootCoord failed to new Etcd client", zap.Any("reason", initError))
-				return initError
-			}
 			if c.kvBase, initError = c.kvBaseCreate(Params.RootCoordCfg.KvRootPath); initError != nil {
 				log.Error("RootCoord failed to new EtcdKV", zap.Any("reason", initError))
 				return initError
@@ -989,10 +989,7 @@ func (c *Core) Init() error {
 		}
 
 		log.Debug("RootCoord, Setting TSO and ID Allocator")
-		kv, initError := tsoutil.NewTSOKVBase(Params.RootCoordCfg.EtcdEndpoints, Params.RootCoordCfg.KvRootPath, "gid")
-		if initError != nil {
-			return
-		}
+		kv := tsoutil.NewTSOKVBase(c.etcdCli, Params.RootCoordCfg.KvRootPath, "gid")
 		idAllocator := allocator.NewGlobalIDAllocator("idTimestamp", kv)
 		if initError = idAllocator.Initialize(); initError != nil {
 			return
@@ -1004,10 +1001,7 @@ func (c *Core) Init() error {
 			return idAllocator.UpdateID()
 		}
 
-		kv, initError = tsoutil.NewTSOKVBase(Params.RootCoordCfg.EtcdEndpoints, Params.RootCoordCfg.KvRootPath, "tso")
-		if initError != nil {
-			return
-		}
+		kv = tsoutil.NewTSOKVBase(c.etcdCli, Params.RootCoordCfg.KvRootPath, "tso")
 		tsoAllocator := tso.NewGlobalTSOAllocator("timestamp", kv)
 		if initError = tsoAllocator.Initialize(); initError != nil {
 			return
@@ -1033,15 +1027,12 @@ func (c *Core) Init() error {
 		c.proxyClientManager = newProxyClientManager(c)
 
 		log.Debug("RootCoord, set proxy manager")
-		c.proxyManager, initError = newProxyManager(
+		c.proxyManager = newProxyManager(
 			c.ctx,
-			Params.RootCoordCfg.EtcdEndpoints,
+			c.etcdCli,
 			c.chanTimeTick.getProxy,
 			c.proxyClientManager.GetProxyClients,
 		)
-		if initError != nil {
-			return
-		}
 		c.proxyManager.AddSession(c.chanTimeTick.addProxy, c.proxyClientManager.AddProxyClient)
 		c.proxyManager.DelSession(c.chanTimeTick.delProxy, c.proxyClientManager.DelProxyClient)
 

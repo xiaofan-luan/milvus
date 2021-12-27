@@ -43,6 +43,7 @@ import (
 	"github.com/milvus-io/milvus/internal/querycoord"
 	"github.com/milvus-io/milvus/internal/querynode"
 	"github.com/milvus-io/milvus/internal/rootcoord"
+	"github.com/milvus-io/milvus/internal/util/etcd"
 	"github.com/milvus-io/milvus/internal/util/healthz"
 	"github.com/milvus-io/milvus/internal/util/metricsinfo"
 	"github.com/milvus-io/milvus/internal/util/paramtable"
@@ -311,7 +312,7 @@ func (mr *MilvusRoles) runIndexNode(ctx context.Context, localMsg bool, alias st
 }
 
 // Run Milvus components.
-func (mr *MilvusRoles) Run(localMsg bool, alias string) {
+func (mr *MilvusRoles) Run(local bool, alias string) {
 	if os.Getenv(metricsinfo.DeployModeEnvKey) == metricsinfo.StandaloneDeployMode {
 		closer := trace.InitTracing("standalone")
 		if closer != nil {
@@ -322,7 +323,7 @@ func (mr *MilvusRoles) Run(localMsg bool, alias string) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// only standalone enable localMsg
-	if localMsg {
+	if local {
 		if err := os.Setenv(metricsinfo.DeployModeEnvKey, metricsinfo.StandaloneDeployMode); err != nil {
 			log.Error("Failed to set deploy mode: ", zap.Error(err))
 		}
@@ -335,6 +336,12 @@ func (mr *MilvusRoles) Run(localMsg bool, alias string) {
 			panic(err)
 		}
 		defer stopRocksmq()
+
+		if paramtable.Params.UseEmbedEtcd {
+			// start etcd server
+			etcd.InitEtcdServer(&paramtable.Params)
+			defer etcd.StopEtcdServer()
+		}
 	} else {
 		if err := os.Setenv(metricsinfo.DeployModeEnvKey, metricsinfo.ClusterDeployMode); err != nil {
 			log.Error("Failed to set deploy mode: ", zap.Error(err))
@@ -343,7 +350,7 @@ func (mr *MilvusRoles) Run(localMsg bool, alias string) {
 
 	var rc *components.RootCoord
 	if mr.EnableRootCoord {
-		rc = mr.runRootCoord(ctx, localMsg)
+		rc = mr.runRootCoord(ctx, local)
 		if rc != nil {
 			defer rc.Stop()
 		}
@@ -352,7 +359,7 @@ func (mr *MilvusRoles) Run(localMsg bool, alias string) {
 	var pn *components.Proxy
 	if mr.EnableProxy {
 		pctx := logutil.WithModule(ctx, "Proxy")
-		pn = mr.runProxy(pctx, localMsg, alias)
+		pn = mr.runProxy(pctx, local, alias)
 		if pn != nil {
 			defer pn.Stop()
 		}
@@ -360,7 +367,7 @@ func (mr *MilvusRoles) Run(localMsg bool, alias string) {
 
 	var qs *components.QueryCoord
 	if mr.EnableQueryCoord {
-		qs = mr.runQueryCoord(ctx, localMsg)
+		qs = mr.runQueryCoord(ctx, local)
 		if qs != nil {
 			defer qs.Stop()
 		}
@@ -368,7 +375,7 @@ func (mr *MilvusRoles) Run(localMsg bool, alias string) {
 
 	var qn *components.QueryNode
 	if mr.EnableQueryNode {
-		qn = mr.runQueryNode(ctx, localMsg, alias)
+		qn = mr.runQueryNode(ctx, local, alias)
 		if qn != nil {
 			defer qn.Stop()
 		}
@@ -376,7 +383,7 @@ func (mr *MilvusRoles) Run(localMsg bool, alias string) {
 
 	var ds *components.DataCoord
 	if mr.EnableDataCoord {
-		ds = mr.runDataCoord(ctx, localMsg)
+		ds = mr.runDataCoord(ctx, local)
 		if ds != nil {
 			defer ds.Stop()
 		}
@@ -384,7 +391,7 @@ func (mr *MilvusRoles) Run(localMsg bool, alias string) {
 
 	var dn *components.DataNode
 	if mr.EnableDataNode {
-		dn = mr.runDataNode(ctx, localMsg, alias)
+		dn = mr.runDataNode(ctx, local, alias)
 		if dn != nil {
 			defer dn.Stop()
 		}
@@ -392,7 +399,7 @@ func (mr *MilvusRoles) Run(localMsg bool, alias string) {
 
 	var is *components.IndexCoord
 	if mr.EnableIndexCoord {
-		is = mr.runIndexCoord(ctx, localMsg)
+		is = mr.runIndexCoord(ctx, local)
 		if is != nil {
 			defer is.Stop()
 		}
@@ -400,13 +407,13 @@ func (mr *MilvusRoles) Run(localMsg bool, alias string) {
 
 	var in *components.IndexNode
 	if mr.EnableIndexNode {
-		in = mr.runIndexNode(ctx, localMsg, alias)
+		in = mr.runIndexNode(ctx, local, alias)
 		if in != nil {
 			defer in.Stop()
 		}
 	}
 
-	if localMsg {
+	if local {
 		standaloneHealthzHandler := func(w http.ResponseWriter, r *http.Request) {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()

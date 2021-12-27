@@ -55,6 +55,7 @@ import (
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
 	"github.com/milvus-io/milvus/internal/util/typeutil"
 	"go.etcd.io/etcd/api/v3/mvccpb"
+	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
 )
 
@@ -99,6 +100,9 @@ type QueryNode struct {
 	// segment loader
 	loader *segmentLoader
 
+	// etcd client
+	etcdCli *clientv3.Client
+
 	// clients
 	rootCoord  types.RootCoord
 	indexCoord types.IndexCoord
@@ -129,7 +133,7 @@ func NewQueryNode(ctx context.Context, factory msgstream.Factory) *QueryNode {
 }
 
 func (node *QueryNode) initSession() error {
-	node.session = sessionutil.NewSession(node.queryNodeLoopCtx, Params.QueryNodeCfg.MetaRootPath, Params.QueryNodeCfg.EtcdEndpoints)
+	node.session = sessionutil.NewSession(node.queryNodeLoopCtx, Params.QueryNodeCfg.MetaRootPath, node.etcdCli)
 	if node.session == nil {
 		return fmt.Errorf("session is nil, the etcd client connection may have failed")
 	}
@@ -179,7 +183,7 @@ func (node *QueryNode) Init() error {
 	var initError error = nil
 	node.initOnce.Do(func() {
 		//ctx := context.Background()
-		log.Debug("QueryNode session info", zap.String("metaPath", Params.QueryNodeCfg.MetaRootPath), zap.Strings("etcdEndPoints", Params.QueryNodeCfg.EtcdEndpoints))
+		log.Debug("QueryNode session info", zap.String("metaPath", Params.QueryNodeCfg.MetaRootPath))
 		err := node.initSession()
 		if err != nil {
 			log.Error("QueryNode init session failed", zap.Error(err))
@@ -187,27 +191,17 @@ func (node *QueryNode) Init() error {
 			return
 		}
 		connectEtcdFn := func() error {
-			etcdKV, err := etcdkv.NewEtcdKV(Params.QueryNodeCfg.EtcdEndpoints, Params.QueryNodeCfg.MetaRootPath)
-			if err != nil {
-				return err
-			}
-			node.etcdKV = etcdKV
+			node.etcdKV = etcdkv.NewEtcdKV(node.etcdCli, Params.QueryNodeCfg.MetaRootPath)
 			return err
 		}
-		log.Debug("queryNode try to connect etcd",
-			zap.Any("EtcdEndpoints", Params.QueryNodeCfg.EtcdEndpoints),
-			zap.Any("MetaRootPath", Params.QueryNodeCfg.MetaRootPath),
-		)
+		log.Debug("queryNode try to connect etcd", zap.Any("MetaRootPath", Params.QueryNodeCfg.MetaRootPath))
 		err = retry.Do(node.queryNodeLoopCtx, connectEtcdFn, retry.Attempts(300))
 		if err != nil {
 			log.Debug("queryNode try to connect etcd failed", zap.Error(err))
 			initError = err
 			return
 		}
-		log.Debug("queryNode try to connect etcd success",
-			zap.Any("EtcdEndpoints", Params.QueryNodeCfg.EtcdEndpoints),
-			zap.Any("MetaRootPath", Params.QueryNodeCfg.MetaRootPath),
-		)
+		log.Debug("queryNode try to connect etcd success", zap.Any("MetaRootPath", Params.QueryNodeCfg.MetaRootPath))
 		node.tSafeReplica = newTSafeReplica()
 
 		streamingReplica := newCollectionReplica(node.etcdKV)
@@ -328,6 +322,11 @@ func (node *QueryNode) Stop() error {
 // UpdateStateCode updata the state of query node, which can be initializing, healthy, and abnormal
 func (node *QueryNode) UpdateStateCode(code internalpb.StateCode) {
 	node.stateCode.Store(code)
+}
+
+// SetEtcdClient assigns parameter client to its member etcdCli
+func (node *QueryNode) SetEtcdClient(client *clientv3.Client) {
+	node.etcdCli = client
 }
 
 // SetRootCoord assigns parameter rc to its member rootCoord.

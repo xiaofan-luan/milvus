@@ -45,6 +45,7 @@ import (
 	"github.com/milvus-io/milvus/internal/util/typeutil"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
 )
 
@@ -82,7 +83,7 @@ const (
 )
 
 type dataNodeCreatorFunc func(ctx context.Context, addr string) (types.DataNode, error)
-type rootCoordCreatorFunc func(ctx context.Context, metaRootPath string, etcdEndpoints []string) (types.RootCoord, error)
+type rootCoordCreatorFunc func(ctx context.Context, metaRootPath string, etcdClient *clientv3.Client) (types.RootCoord, error)
 
 // makes sure Server implements `DataCoord`
 var _ types.DataCoord = (*Server)(nil)
@@ -100,6 +101,7 @@ type Server struct {
 	isServing        ServerState
 	helper           ServerHelper
 
+	etcdCli          *clientv3.Client
 	kvClient         *etcdkv.EtcdKV
 	meta             *meta
 	segmentManager   Manager
@@ -177,7 +179,7 @@ func SetSegmentManager(manager Manager) Option {
 }
 
 // CreateServer creates a `Server` instance
-func CreateServer(ctx context.Context, factory msgstream.Factory, opts ...Option) (*Server, error) {
+func CreateServer(ctx context.Context, factory msgstream.Factory, opts ...Option) *Server {
 	rand.Seed(time.Now().UnixNano())
 	s := &Server{
 		ctx:                    ctx,
@@ -194,15 +196,15 @@ func CreateServer(ctx context.Context, factory msgstream.Factory, opts ...Option
 	for _, opt := range opts {
 		opt(s)
 	}
-	return s, nil
+	return s
 }
 
 func defaultDataNodeCreatorFunc(ctx context.Context, addr string) (types.DataNode, error) {
 	return datanodeclient.NewClient(ctx, addr)
 }
 
-func defaultRootCoordCreatorFunc(ctx context.Context, metaRootPath string, etcdEndpoints []string) (types.RootCoord, error) {
-	return rootcoordclient.NewClient(ctx, metaRootPath, etcdEndpoints)
+func defaultRootCoordCreatorFunc(ctx context.Context, metaRootPath string, client *clientv3.Client) (types.RootCoord, error) {
+	return rootcoordclient.NewClient(ctx, metaRootPath, client)
 }
 
 // QuitSignal returns signal when server quits
@@ -225,7 +227,7 @@ func (s *Server) Register() error {
 }
 
 func (s *Server) initSession() error {
-	s.session = sessionutil.NewSession(s.ctx, Params.DataCoordCfg.MetaRootPath, Params.DataCoordCfg.EtcdEndpoints)
+	s.session = sessionutil.NewSession(s.ctx, Params.DataCoordCfg.MetaRootPath, s.etcdCli)
 	if s.session == nil {
 		return errors.New("failed to initialize session")
 	}
@@ -309,6 +311,11 @@ func (s *Server) initCluster() error {
 	s.sessionManager = NewSessionManager(withSessionCreator(s.dataNodeCreator))
 	s.cluster = NewCluster(s.sessionManager, s.channelManager)
 	return nil
+}
+
+// SetEtcdClient sets etcd client for datacoord.
+func (s *Server) SetEtcdClient(client *clientv3.Client) {
+	s.etcdCli = client
 }
 
 func (s *Server) createCompactionHandler() {
@@ -407,20 +414,17 @@ func (s *Server) startSegmentManager() {
 }
 
 func (s *Server) initMeta() error {
-	connectEtcdFn := func() error {
-		etcdKV, err := etcdkv.NewEtcdKV(Params.DataCoordCfg.EtcdEndpoints, Params.DataCoordCfg.MetaRootPath)
-		if err != nil {
-			return err
-		}
-
-		s.kvClient = etcdKV
+	etcdKV := etcdkv.NewEtcdKV(s.etcdCli, Params.DataCoordCfg.MetaRootPath)
+	s.kvClient = etcdKV
+	reloadEtcdFn := func() error {
+		var err error
 		s.meta, err = newMeta(s.kvClient)
 		if err != nil {
 			return err
 		}
 		return nil
 	}
-	return retry.Do(s.ctx, connectEtcdFn, retry.Attempts(connEtcdMaxRetryTime))
+	return retry.Do(s.ctx, reloadEtcdFn, retry.Attempts(connEtcdMaxRetryTime))
 }
 
 func (s *Server) startServerLoop() {
@@ -724,7 +728,7 @@ func (s *Server) handleFlushingSegments(ctx context.Context) {
 
 func (s *Server) initRootCoordClient() error {
 	var err error
-	if s.rootCoordClient, err = s.rootCoordClientCreator(s.ctx, Params.DataCoordCfg.MetaRootPath, Params.DataCoordCfg.EtcdEndpoints); err != nil {
+	if s.rootCoordClient, err = s.rootCoordClientCreator(s.ctx, Params.DataCoordCfg.MetaRootPath, s.etcdCli); err != nil {
 		return err
 	}
 	if err = s.rootCoordClient.Init(); err != nil {

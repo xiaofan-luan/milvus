@@ -28,6 +28,7 @@ import (
 	"github.com/milvus-io/milvus/internal/proto/milvuspb"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
 	"github.com/milvus-io/milvus/internal/util/typeutil"
+	"github.com/milvus-io/milvus/internal/util/etcd"
 )
 
 // Mock is an alternative to IndexCoord, it will return specific results based on specific parameters.
@@ -67,9 +68,16 @@ func (icm *Mock) Register() error {
 	if icm.Failure {
 		return errors.New("IndexCoordinate register failed")
 	}
-	icm.etcdKV, _ = etcdkv.NewEtcdKV(Params.IndexCoordCfg.EtcdEndpoints, Params.IndexCoordCfg.MetaRootPath)
-	err := icm.etcdKV.RemoveWithPrefix("session/" + typeutil.IndexCoordRole)
-	session := sessionutil.NewSession(context.Background(), Params.IndexCoordCfg.MetaRootPath, Params.IndexCoordCfg.EtcdEndpoints)
+	etcdCli, err := etcd.GetEtcdClient(&Params.BaseParams)
+	if err != nil {
+		return err
+	}
+	icm.etcdKV = etcdkv.NewEtcdKV(etcdCli, Params.IndexCoordCfg.MetaRootPath)
+	err = icm.etcdKV.RemoveWithPrefix("session/" + typeutil.IndexCoordRole)
+	if err != nil {
+		return err
+	}
+	session := sessionutil.NewSession(context.Background(), Params.IndexCoordCfg.MetaRootPath, etcdCli)
 	session.Init(typeutil.IndexCoordRole, Params.IndexCoordCfg.Address, true)
 	session.Register()
 	return err

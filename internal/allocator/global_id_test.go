@@ -20,9 +20,11 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/milvus-io/milvus/internal/util/tsoutil"
 	"github.com/stretchr/testify/assert"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 var gTestIDAllocator *GlobalIDAllocator
@@ -33,8 +35,13 @@ func TestGlobalTSOAllocator_All(t *testing.T) {
 		endpoints = "localhost:2379"
 	}
 	etcdEndpoints := strings.Split(endpoints, ",")
-	etcdKV, err := tsoutil.NewTSOKVBase(etcdEndpoints, "/test/root/kv", "gidTest")
+	etcdCli, err := clientv3.New(clientv3.Config{
+		Endpoints:   etcdEndpoints,
+		DialTimeout: 5 * time.Second,
+	})
 	assert.NoError(t, err)
+	defer etcdCli.Close()
+	etcdKV := tsoutil.NewTSOKVBase(etcdCli, "/test/root/kv", "gidTest")
 
 	gTestIDAllocator = NewGlobalIDAllocator("idTimestamp", etcdKV)
 

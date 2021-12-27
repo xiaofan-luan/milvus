@@ -39,6 +39,7 @@ import (
 	"github.com/milvus-io/milvus/internal/util/paramtable"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
 	"github.com/milvus-io/milvus/internal/util/typeutil"
+	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
 )
 
@@ -68,6 +69,7 @@ type Proxy struct {
 
 	stateCode atomic.Value
 
+	etcdCli    *clientv3.Client
 	rootCoord  types.RootCoord
 	indexCoord types.IndexCoord
 	dataCoord  types.DataCoord
@@ -125,7 +127,7 @@ func (node *Proxy) Register() error {
 }
 
 func (node *Proxy) initSession() error {
-	node.session = sessionutil.NewSession(node.ctx, Params.ProxyCfg.MetaRootPath, Params.ProxyCfg.EtcdEndpoints)
+	node.session = sessionutil.NewSession(node.ctx, Params.ProxyCfg.MetaRootPath, node.etcdCli)
 	if node.session == nil {
 		return errors.New("new session failed, maybe etcd cannot be connected")
 	}
@@ -412,6 +414,11 @@ func (node *Proxy) lastTick() Timestamp {
 // AddCloseCallback adds a callback in the Close phase.
 func (node *Proxy) AddCloseCallback(callbacks ...func()) {
 	node.closeCallbacks = append(node.closeCallbacks, callbacks...)
+}
+
+// SetEtcdClient sets etcd client for proxy.
+func (node *Proxy) SetEtcdClient(client *clientv3.Client) {
+	node.etcdCli = client
 }
 
 // SetRootCoordClient sets RootCoord client for proxy.

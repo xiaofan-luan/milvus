@@ -23,6 +23,7 @@ import (
 	"time"
 
 	etcdkv "github.com/milvus-io/milvus/internal/kv/etcd"
+	"github.com/milvus-io/milvus/internal/util/etcd"
 	"github.com/milvus-io/milvus/internal/util/paramtable"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -44,11 +45,12 @@ func TestEtcdKV_Load(te *testing.T) {
 	}
 
 	etcdEndPoints := strings.Split(endpoints, ",")
-
+	etcdCli, err := etcd.GetRemoteEtcdClient(etcdEndPoints)
+	defer etcdCli.Close()
+	assert.NoError(te, err)
 	te.Run("EtcdKV SaveAndLoad", func(t *testing.T) {
 		rootPath := "/etcd/test/root/saveandload"
-		etcdKV, err := etcdkv.NewEtcdKV(etcdEndPoints, rootPath)
-		require.NoError(t, err)
+		etcdKV := etcdkv.NewEtcdKV(etcdCli, rootPath)
 		err = etcdKV.RemoveWithPrefix("")
 		require.NoError(t, err)
 
@@ -157,8 +159,7 @@ func TestEtcdKV_Load(te *testing.T) {
 
 	te.Run("EtcdKV LoadWithRevision", func(t *testing.T) {
 		rootPath := "/etcd/test/root/LoadWithRevision"
-		etcdKV, err := etcdkv.NewEtcdKV(etcdEndPoints, rootPath)
-		assert.Nil(t, err)
+		etcdKV := etcdkv.NewEtcdKV(etcdCli, rootPath)
 
 		defer etcdKV.Close()
 		defer etcdKV.RemoveWithPrefix("")
@@ -202,8 +203,7 @@ func TestEtcdKV_Load(te *testing.T) {
 
 	te.Run("EtcdKV MultiSaveAndMultiLoad", func(t *testing.T) {
 		rootPath := "/etcd/test/root/multi_save_and_multi_load"
-		etcdKV, err := etcdkv.NewEtcdKV(etcdEndPoints, rootPath)
-		assert.Nil(t, err)
+		etcdKV := etcdkv.NewEtcdKV(etcdCli, rootPath)
 
 		defer etcdKV.Close()
 		defer etcdKV.RemoveWithPrefix("")
@@ -311,9 +311,7 @@ func TestEtcdKV_Load(te *testing.T) {
 
 	te.Run("EtcdKV MultiRemoveWithPrefix", func(t *testing.T) {
 		rootPath := "/etcd/test/root/multi_remove_with_prefix"
-		etcdKV, err := etcdkv.NewEtcdKV(etcdEndPoints, rootPath)
-		require.NoError(t, err)
-
+		etcdKV := etcdkv.NewEtcdKV(etcdCli, rootPath)
 		defer etcdKV.Close()
 		defer etcdKV.RemoveWithPrefix("")
 
@@ -399,8 +397,7 @@ func TestEtcdKV_Load(te *testing.T) {
 
 	te.Run("EtcdKV Watch", func(t *testing.T) {
 		rootPath := "/etcd/test/root/watch"
-		etcdKV, err := etcdkv.NewEtcdKV(etcdEndPoints, rootPath)
-		assert.Nil(t, err)
+		etcdKV := etcdkv.NewEtcdKV(etcdCli, rootPath)
 
 		defer etcdKV.Close()
 		defer etcdKV.RemoveWithPrefix("")
@@ -416,9 +413,7 @@ func TestEtcdKV_Load(te *testing.T) {
 
 	te.Run("Etcd Revision", func(t *testing.T) {
 		rootPath := "/etcd/test/root/watch"
-		etcdKV, err := etcdkv.NewEtcdKV(etcdEndPoints, rootPath)
-		assert.Nil(t, err)
-
+		etcdKV := etcdkv.NewEtcdKV(etcdCli, rootPath)
 		defer etcdKV.Close()
 		defer etcdKV.RemoveWithPrefix("")
 
@@ -467,8 +462,7 @@ func TestEtcdKV_Load(te *testing.T) {
 
 	te.Run("Etcd Lease", func(t *testing.T) {
 		rootPath := "/etcd/test/root/lease"
-		etcdKV, err := etcdkv.NewEtcdKV(etcdEndPoints, rootPath)
-		assert.Nil(t, err)
+		etcdKV := etcdkv.NewEtcdKV(etcdCli, rootPath)
 
 		defer etcdKV.Close()
 		defer etcdKV.RemoveWithPrefix("")

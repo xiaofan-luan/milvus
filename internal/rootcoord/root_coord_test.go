@@ -50,6 +50,7 @@ import (
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
 	"github.com/milvus-io/milvus/internal/util/typeutil"
+	"github.com/milvus-io/milvus/internal/util/etcd"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -433,9 +434,15 @@ func TestRootCoordInit(t *testing.T) {
 	coreFactory := msgstream.NewPmsFactory()
 	Params.Init()
 	Params.RootCoordCfg.DmlChannelNum = TestDMLChannelNum
+
+	etcdCli, err := etcd.GetEtcdClient(&Params.BaseParams)
+	assert.NoError(t, err)
+	defer etcdCli.Close()
+
 	core, err := NewCore(ctx, coreFactory)
 	require.Nil(t, err)
 	assert.Nil(t, err)
+	core.SetEtcdClient(etcdCli)
 	randVal := rand.Int()
 
 	Params.RootCoordCfg.MetaRootPath = fmt.Sprintf("/%d/%s", randVal, Params.RootCoordCfg.MetaRootPath)
@@ -449,6 +456,7 @@ func TestRootCoordInit(t *testing.T) {
 
 	// inject kvBaseCreate fail
 	core, err = NewCore(ctx, coreFactory)
+	core.SetEtcdClient(etcdCli)
 	require.Nil(t, err)
 	assert.Nil(t, err)
 	randVal = rand.Int()
@@ -467,6 +475,7 @@ func TestRootCoordInit(t *testing.T) {
 
 	// inject metaKV create fail
 	core, err = NewCore(ctx, coreFactory)
+	core.SetEtcdClient(etcdCli)
 	require.Nil(t, err)
 	assert.Nil(t, err)
 	randVal = rand.Int()
@@ -488,6 +497,7 @@ func TestRootCoordInit(t *testing.T) {
 
 	// inject newSuffixSnapshot failure
 	core, err = NewCore(ctx, coreFactory)
+	core.SetEtcdClient(etcdCli)
 	require.Nil(t, err)
 	assert.Nil(t, err)
 	randVal = rand.Int()
@@ -506,6 +516,7 @@ func TestRootCoordInit(t *testing.T) {
 
 	// inject newMetaTable failure
 	core, err = NewCore(ctx, coreFactory)
+	core.SetEtcdClient(etcdCli)
 	require.Nil(t, err)
 	assert.Nil(t, err)
 	randVal = rand.Int()
@@ -553,8 +564,9 @@ func TestRootCoord(t *testing.T) {
 	Params.RootCoordCfg.DmlChannelName = fmt.Sprintf("rootcoord-dml-test-%d", randVal)
 	Params.RootCoordCfg.DeltaChannelName = fmt.Sprintf("rootcoord-delta-test-%d", randVal)
 
-	etcdCli, err := clientv3.New(clientv3.Config{Endpoints: Params.RootCoordCfg.EtcdEndpoints, DialTimeout: 5 * time.Second})
+	etcdCli, err := etcd.GetEtcdClient(&Params.BaseParams)
 	assert.Nil(t, err)
+	defer etcdCli.Close()
 	sessKey := path.Join(Params.RootCoordCfg.MetaRootPath, sessionutil.DefaultServiceRoot)
 	_, err = etcdCli.Delete(ctx, sessKey, clientv3.WithPrefix())
 	assert.Nil(t, err)
@@ -615,6 +627,8 @@ func TestRootCoord(t *testing.T) {
 
 	dmlStream, _ := tmpFactory.NewMsgStream(ctx)
 	clearMsgChan(1500*time.Millisecond, dmlStream.Chan())
+
+	core.SetEtcdClient(etcdCli)
 
 	err = core.Init()
 	assert.Nil(t, err)
@@ -2215,6 +2229,11 @@ func TestRootCoord2(t *testing.T) {
 	Params.RootCoordCfg.DmlChannelNum = TestDMLChannelNum
 	core, err := NewCore(ctx, msFactory)
 	assert.Nil(t, err)
+
+	etcdCli, err := etcd.GetEtcdClient(&Params.BaseParams)
+	assert.Nil(t, err)
+	defer etcdCli.Close()
+
 	randVal := rand.Int()
 
 	Params.RootCoordCfg.TimeTickChannel = fmt.Sprintf("rootcoord-time-tick-%d", randVal)
@@ -2248,6 +2267,7 @@ func TestRootCoord2(t *testing.T) {
 		return nil, nil
 	}
 
+	core.SetEtcdClient(etcdCli)
 	err = core.Init()
 	assert.Nil(t, err)
 
@@ -2516,6 +2536,10 @@ func TestCheckFlushedSegments(t *testing.T) {
 		return nil, nil
 	}
 
+	etcdCli, err := etcd.GetEtcdClient(&Params.BaseParams)
+	assert.Nil(t, err)
+	defer etcdCli.Close()
+	core.SetEtcdClient(etcdCli)
 	err = core.Init()
 	assert.Nil(t, err)
 
@@ -2673,6 +2697,11 @@ func TestRootCoord_CheckZeroShardsNum(t *testing.T) {
 		return nil, nil
 	}
 
+	etcdCli, err := etcd.GetEtcdClient(&Params.BaseParams)
+	assert.NoError(t, err)
+	defer etcdCli.Close()
+
+	core.SetEtcdClient(etcdCli)
 	err = core.Init()
 	assert.Nil(t, err)
 

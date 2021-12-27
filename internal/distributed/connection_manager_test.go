@@ -28,6 +28,7 @@ import (
 	"github.com/milvus-io/milvus/internal/proto/indexpb"
 	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
+	"github.com/milvus-io/milvus/internal/util/etcd"
 	"github.com/milvus-io/milvus/internal/util/paramtable"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
 	"github.com/milvus-io/milvus/internal/util/typeutil"
@@ -250,6 +251,10 @@ func initSession(ctx context.Context) *sessionutil.Session {
 	log.Debug("metaRootPath", zap.Any("metaRootPath", metaRootPath))
 	log.Debug("etcdPoints", zap.Any("etcdPoints", etcdEndpoints))
 
-	session := sessionutil.NewSession(ctx, metaRootPath, etcdEndpoints)
+	etcdCli, err := etcd.GetRemoteEtcdClient(etcdEndpoints)
+	if err != nil {
+		panic(err)
+	}
+	session := sessionutil.NewSession(ctx, metaRootPath, etcdCli)
 	return session
 }

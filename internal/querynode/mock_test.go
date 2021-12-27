@@ -43,6 +43,7 @@ import (
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/util"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
+	"github.com/milvus-io/milvus/internal/util/etcd"
 )
 
 // ---------- unittest util functions ----------
@@ -370,8 +371,12 @@ func genMinioKV(ctx context.Context) (*minioKV.MinIOKV, error) {
 }
 
 func genEtcdKV() (*etcdkv.EtcdKV, error) {
-	etcdKV, err := etcdkv.NewEtcdKV(Params.QueryNodeCfg.EtcdEndpoints, Params.QueryNodeCfg.MetaRootPath)
-	return etcdKV, err
+	etcdCli, err := etcd.GetEtcdClient(&Params.BaseParams)
+	if err != nil {
+		return nil, err
+	}
+	etcdKV := etcdkv.NewEtcdKV(etcdCli, Params.QueryNodeCfg.MetaRootPath)
+	return etcdKV, nil
 }
 
 func genFactory() (msgstream.Factory, error) {

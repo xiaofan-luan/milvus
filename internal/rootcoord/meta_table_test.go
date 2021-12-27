@@ -32,8 +32,9 @@ import (
 	pb "github.com/milvus-io/milvus/internal/proto/etcdpb"
 	"github.com/milvus-io/milvus/internal/proto/schemapb"
 	"github.com/milvus-io/milvus/internal/util/typeutil"
+	"github.com/milvus-io/milvus/internal/util/etcd"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/assert"
-	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 type mockTestKV struct {
@@ -220,13 +221,14 @@ func TestMetaTable(t *testing.T) {
 		return vtso
 	}
 
-	etcdCli, err := clientv3.New(clientv3.Config{Endpoints: Params.RootCoordCfg.EtcdEndpoints})
-	assert.Nil(t, err)
+	etcdCli, err := etcd.GetEtcdClient(&Params.BaseParams)
+	require.Nil(t, err)
 	defer etcdCli.Close()
+
 	skv, err := newMetaSnapshot(etcdCli, rootPath, TimestampPrefix, 7)
 	assert.Nil(t, err)
 	assert.NotNil(t, skv)
-	txnKV := etcdkv.NewEtcdKVWithClient(etcdCli, rootPath)
+	txnKV := etcdkv.NewEtcdKV(etcdCli, rootPath)
 	mt, err := NewMetaTable(txnKV, skv)
 	assert.Nil(t, err)
 
@@ -535,7 +537,7 @@ func TestMetaTable(t *testing.T) {
 	})
 
 	/////////////////////////// these tests should run at last, it only used to hit the error lines ////////////////////////
-	txnkv := etcdkv.NewEtcdKVWithClient(etcdCli, rootPath)
+	txnkv := etcdkv.NewEtcdKV(etcdCli, rootPath)
 	mockKV := &mockTestKV{}
 	mt.snapshot = mockKV
 	mockTxnKV := &mockTestTxnKV{
@@ -1088,15 +1090,14 @@ func TestMetaWithTimestamp(t *testing.T) {
 		vtso++
 		return vtso
 	}
-
-	etcdCli, err := clientv3.New(clientv3.Config{Endpoints: Params.RootCoordCfg.EtcdEndpoints})
+	etcdCli, err := etcd.GetEtcdClient(&Params.BaseParams)
 	assert.Nil(t, err)
 	defer etcdCli.Close()
 
 	skv, err := newMetaSnapshot(etcdCli, rootPath, TimestampPrefix, 7)
 	assert.Nil(t, err)
 	assert.NotNil(t, skv)
-	txnKV := etcdkv.NewEtcdKVWithClient(etcdCli, rootPath)
+	txnKV := etcdkv.NewEtcdKV(etcdCli, rootPath)
 	mt, err := NewMetaTable(txnKV, skv)
 	assert.Nil(t, err)
 
@@ -1246,7 +1247,7 @@ func TestFixIssue10540(t *testing.T) {
 	Params.Init()
 	rootPath := fmt.Sprintf("/test/meta/%d", randVal)
 
-	etcdCli, err := clientv3.New(clientv3.Config{Endpoints: Params.RootCoordCfg.EtcdEndpoints})
+	etcdCli, err := etcd.GetEtcdClient(&Params.BaseParams)
 	assert.Nil(t, err)
 	defer etcdCli.Close()
 

@@ -23,6 +23,7 @@ import (
 	"github.com/milvus-io/milvus/internal/indexnode"
 
 	"github.com/milvus-io/milvus/internal/util/metricsinfo"
+	"github.com/milvus-io/milvus/internal/util/etcd"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -32,6 +33,11 @@ func TestGetSystemInfoMetrics(t *testing.T) {
 	assert.Nil(t, err)
 	Params.Init()
 
+	etcdCli, err := etcd.GetEtcdClient(&Params.BaseParams)
+	defer etcdCli.Close()
+	assert.NoError(t, err)
+
+	ic.SetEtcdClient(etcdCli)
 	err = ic.Init()
 	assert.Nil(t, err)
 	err = ic.Start()

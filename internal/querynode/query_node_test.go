@@ -34,6 +34,7 @@ import (
 	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/proto/schemapb"
 	"github.com/milvus-io/milvus/internal/types"
+	"github.com/milvus-io/milvus/internal/util/etcd"
 )
 
 // mock of query coordinator client
@@ -186,11 +187,11 @@ func newQueryNodeMock() *QueryNode {
 			cancel()
 		}()
 	}
-
-	etcdKV, err := etcdkv.NewEtcdKV(Params.QueryNodeCfg.EtcdEndpoints, Params.QueryNodeCfg.MetaRootPath)
+	etcdCli, err := etcd.GetEtcdClient(&Params.BaseParams)
 	if err != nil {
 		panic(err)
 	}
+	etcdKV := etcdkv.NewEtcdKV(etcdCli, Params.QueryNodeCfg.MetaRootPath)
 
 	msFactory, err := newMessageStreamFactory()
 	if err != nil {
@@ -270,6 +271,10 @@ func TestQueryNode_register(t *testing.T) {
 	node, err := genSimpleQueryNode(ctx)
 	assert.NoError(t, err)
 
+	etcdcli, err := etcd.GetEtcdClient(&Params.BaseParams)
+	assert.NoError(t, err)
+	defer etcdcli.Close()
+	node.SetEtcdClient(etcdcli)
 	err = node.initSession()
 	assert.NoError(t, err)
 
@@ -283,7 +288,10 @@ func TestQueryNode_init(t *testing.T) {
 
 	node, err := genSimpleQueryNode(ctx)
 	assert.NoError(t, err)
-
+	etcdcli, err := etcd.GetEtcdClient(&Params.BaseParams)
+	assert.NoError(t, err)
+	defer etcdcli.Close()
+	node.SetEtcdClient(etcdcli)
 	err = node.Init()
 	assert.Error(t, err)
 }
