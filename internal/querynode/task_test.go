@@ -377,6 +377,39 @@ func TestTask_watchDmChannelsTask(t *testing.T) {
 		err = task.Execute(ctx)
 		assert.Error(t, err)
 	})
+
+	t.Run("test load growing segment", func(t *testing.T) {
+		node, err := genSimpleQueryNode(ctx)
+		assert.NoError(t, err)
+
+		task := watchDmChannelsTask{
+			req:  genWatchDMChannelsRequest(),
+			node: node,
+		}
+
+		fieldBinlog, err := saveSimpleBinLog(ctx)
+		assert.NoError(t, err)
+
+		task.req.Infos = []*datapb.VchannelInfo{
+			{
+				CollectionID: defaultCollectionID,
+				ChannelName:  defaultDMLChannel,
+				UnflushedSegments: []*datapb.SegmentInfo{
+					{
+						CollectionID: defaultCollectionID,
+						PartitionID:  defaultPartitionID + 1, // load a new partition
+						DmlPosition: &internalpb.MsgPosition{
+							ChannelName: defaultDMLChannel,
+							Timestamp:   typeutil.MaxTimestamp,
+						},
+						Binlogs: fieldBinlog,
+					},
+				},
+			},
+		}
+		err = task.Execute(ctx)
+		assert.NoError(t, err)
+	})
 }
 
 func TestTask_watchDeltaChannelsTask(t *testing.T) {
@@ -738,7 +771,8 @@ func TestTask_releasePartitionTask(t *testing.T) {
 			req:  genReleasePartitionsRequest(),
 			node: node,
 		}
-		task.node.dataSyncService.addFlowGraphsForDMLChannels(defaultCollectionID, []Channel{defaultDMLChannel})
+		_, err = task.node.dataSyncService.addFlowGraphsForDMLChannels(defaultCollectionID, []Channel{defaultDMLChannel})
+		assert.NoError(t, err)
 		err = task.Execute(ctx)
 		assert.NoError(t, err)
 	})
@@ -781,7 +815,8 @@ func TestTask_releasePartitionTask(t *testing.T) {
 			req:  genReleasePartitionsRequest(),
 			node: node,
 		}
-		task.node.dataSyncService.addFlowGraphsForDMLChannels(defaultCollectionID, []Channel{defaultDMLChannel})
+		_, err = task.node.dataSyncService.addFlowGraphsForDMLChannels(defaultCollectionID, []Channel{defaultDMLChannel})
+		assert.NoError(t, err)
 		err = task.Execute(ctx)
 		assert.NoError(t, err)
 	})

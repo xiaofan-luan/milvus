@@ -327,3 +327,8 @@ func (s *Server) GetFlushState(ctx context.Context, req *milvuspb.GetFlushStateR
 func (s *Server) DropVirtualChannel(ctx context.Context, req *datapb.DropVirtualChannelRequest) (*datapb.DropVirtualChannelResponse, error) {
 	return s.dataCoord.DropVirtualChannel(ctx, req)
 }
+
+// Import data files(json, numpy, etc.) on MinIO/S3 storage, read and parse them into sealed segments
+func (s *Server) Import(ctx context.Context, req *datapb.ImportTask) (*commonpb.Status, error) {
+	return s.dataCoord.Import(ctx, req)
+}
