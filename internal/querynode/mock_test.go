@@ -671,6 +671,21 @@ func genFactory() (msgstream.Factory, error) {
 	return msFactory, nil
 }
 
+func genInvalidFactory() (msgstream.Factory, error) {
+	const receiveBufSize = 1024
+
+	msFactory := msgstream.NewPmsFactory()
+	m := map[string]interface{}{
+		"receiveBufSize": receiveBufSize,
+		"pulsarAddress":  "",
+		"pulsarBufSize":  1024}
+	err := msFactory.SetParams(m)
+	if err != nil {
+		return nil, err
+	}
+	return msFactory, nil
+}
+
 func genQueryMsgStream(ctx context.Context) (msgstream.MsgStream, error) {
 	fac, err := genFactory()
 	if err != nil {
@@ -1615,24 +1630,6 @@ func initConsumer(ctx context.Context, queryResultChannel Channel) (msgstream.Ms
 	stream.AsConsumer([]string{queryResultChannel}, defaultSubName)
 	stream.Start()
 	return stream, nil
-}
-
-func consumeSimpleSearchResult(stream msgstream.MsgStream) (*msgstream.SearchResultMsg, error) {
-	res := stream.Consume()
-	if len(res.Msgs) != 1 {
-		err := errors.New("unexpected message length")
-		return nil, err
-	}
-	return res.Msgs[0].(*msgstream.SearchResultMsg), nil
-}
-
-func consumeSimpleRetrieveResult(stream msgstream.MsgStream) (*msgstream.RetrieveResultMsg, error) {
-	res := stream.Consume()
-	if len(res.Msgs) != 1 {
-		err := errors.New("unexpected message length")
-		return nil, err
-	}
-	return res.Msgs[0].(*msgstream.RetrieveResultMsg), nil
 }
 
 func genSimpleChangeInfo() *querypb.SealedSegmentsChangeInfo {
