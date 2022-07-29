@@ -21,7 +21,7 @@ function install_linux_deps() {
       # for Ubuntu 18.04
       sudo apt install -y g++ gcc make ccache libssl-dev zlib1g-dev libboost-regex-dev \
           libboost-program-options-dev libboost-system-dev libboost-filesystem-dev \
-          libboost-serialization-dev python3-dev libboost-python-dev libcurl4-openssl-dev gfortran libtbb-dev libzstd-devel
+          libboost-serialization-dev python3-dev libboost-python-dev libcurl4-openssl-dev gfortran libtbb-dev libzstd-dev
       # install OpenBLAS, this could take a while.
       wget https://github.com/xianyi/OpenBLAS/archive/v0.3.9.tar.gz && \
           tar zxvf v0.3.9.tar.gz && cd OpenBLAS-0.3.9 && \

@@ -19,7 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends wget curl ca-ce
     apt-get remove --purge -y && \
     rm -rf /var/lib/apt/lists/*
 
-RUN apt-get update && apt-get install -y --no-install-recommends libzstd-devel
+RUN apt-get update && apt-get install -y --no-install-recommends libzstd-dev
 
 # Install Go
 ENV GOPATH /go
