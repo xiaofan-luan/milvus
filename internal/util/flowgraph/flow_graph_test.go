@@ -56,6 +56,10 @@ func (m *numMsg) TimeTick() Timestamp {
 	return Timestamp(0)
 }
 
+func (m *numMsg) IsClose() bool {
+	return false
+}
+
 func (n *nodeA) Name() string {
 	return "NodeA"
 }
