@@ -19,9 +19,10 @@ package rootcoord
 import (
 	"sync"
 
+	"github.com/milvus-io/milvus/internal/log"
 	"github.com/milvus-io/milvus/internal/tso"
-
 	"go.uber.org/atomic"
+	"go.uber.org/zap"
 )
 
 type DdlTsLockManager interface {
@@ -48,6 +49,7 @@ func (c *ddlTsLockManager) GetMinDdlTs() Timestamp {
 	defer c.Unlock()
 	ts, err := c.tsoAllocator.GenerateTSO(1)
 	if err != nil {
+		log.Warn("failed to generate timestamp", zap.Error(err))
 		return c.lastTs.Load()
 	}
 	c.UpdateLastTs(ts)

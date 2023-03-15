@@ -1365,12 +1365,19 @@ func (c *Core) AllocTimestamp(ctx context.Context, in *rootcoordpb.AllocTimestam
 
 	ts, err := c.tsoAllocator.GenerateTSO(in.GetCount())
 	if err != nil {
-		log.Ctx(ctx).Error("failed to allocate timestamp", zap.String("role", typeutil.RootCoordRole),
+		log.Ctx(ctx).Warn("failed to allocate timestamp", zap.String("role", typeutil.RootCoordRole),
 			zap.Error(err),
 			zap.Int64("msgID", in.GetBase().GetMsgID()))
 
 		return &rootcoordpb.AllocTimestampResponse{
 			Status: failStatus(commonpb.ErrorCode_UnexpectedError, "AllocTimestamp failed: "+err.Error()),
+		}, nil
+	}
+	select {
+	case <-ctx.Done():
+		log.Ctx(ctx).Warn("alloc timestamp too long", zap.Error(ctx.Err()))
+		return &rootcoordpb.AllocTimestampResponse{
+			Status: failStatus(commonpb.ErrorCode_UnexpectedError, "AllocTimestamp failed: "+ctx.Err().Error()),
 		}, nil
 	}
 

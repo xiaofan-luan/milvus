@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"reflect"
 	"sync/atomic"
+	"time"
 
 	"github.com/milvus-io/milvus/internal/util/timerecord"
 
@@ -340,7 +341,7 @@ func (ddn *ddNode) sendDeltaTimeTick(ts Timestamp) error {
 		TimeTickMsg: timeTickResult,
 	}
 	msgPack.Msgs = append(msgPack.Msgs, timeTickMsg)
-
+	startTs := time.Now()
 	if err := ddn.deltaMsgStream.Produce(&msgPack); err != nil {
 		return err
 	}
@@ -349,6 +350,7 @@ func (ddn *ddNode) sendDeltaTimeTick(ts Timestamp) error {
 		zap.Any("collectionID", ddn.collectionID),
 		zap.Any("ts", ts),
 		zap.Any("ts_p", p),
+		zap.Any("time send", time.Since(startTs)),
 		zap.Any("channel", ddn.vChannelName),
 	)
 	return nil

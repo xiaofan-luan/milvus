@@ -39,7 +39,7 @@ func errDataNodeIsUnhealthy(nodeID UniqueID) error {
 }
 
 func setNotServingStatus(status *commonpb.Status, stateCode commonpb.StateCode) {
-	reason := fmt.Sprintf("sate code: %s", stateCode.String())
+	reason := fmt.Sprintf("state code: %s", stateCode.String())
 	status.Reason = errorutil.NotServingReason(typeutil.DataNodeRole, Params.DataCoordCfg.GetNodeID(), reason)
 	status.ErrorCode = commonpb.ErrorCode_NotReadyServe
 }

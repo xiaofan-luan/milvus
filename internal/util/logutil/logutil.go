@@ -141,7 +141,7 @@ var once sync.Once
 func SetupLogger(cfg *log.Config) {
 	once.Do(func() {
 		// Initialize logger.
-		logger, p, err := log.InitLogger(cfg, zap.AddStacktrace(zap.ErrorLevel))
+		logger, p, err := log.InitLogger(cfg, zap.AddStacktrace(zap.WarnLevel))
 		if err == nil {
 			log.ReplaceGlobals(logger, p)
 		} else {

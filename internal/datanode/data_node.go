@@ -345,7 +345,7 @@ func (node *DataNode) handleWatchInfo(e *event, key string, data []byte) {
 		}
 
 		if isEndWatchState(watchInfo.State) {
-			log.Info("DataNode received a PUT event with an end State", zap.String("state", watchInfo.State.String()))
+			log.Info("DataNode received a PUT event with an end State", zap.String("state", watchInfo.State.String()), zap.String("channel", watchInfo.Vchan.ChannelName))
 			return
 		}
 

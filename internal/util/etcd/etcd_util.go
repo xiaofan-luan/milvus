@@ -27,8 +27,10 @@ import (
 
 	"github.com/pkg/errors"
 
+	"github.com/milvus-io/milvus/internal/log"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/server/v3/embed"
+	"go.uber.org/zap"
 )
 
 var (
@@ -55,9 +57,13 @@ func GetEtcdClient(
 
 // GetRemoteEtcdClient returns client of remote etcd by given endpoints
 func GetRemoteEtcdClient(endpoints []string) (*clientv3.Client, error) {
+	etcdLogCfg := zap.NewProductionConfig()
+	// etcd client use the same level
+	etcdLogCfg.Level = zap.NewAtomicLevelAt(log.Level().Level())
 	return clientv3.New(clientv3.Config{
 		Endpoints:   endpoints,
 		DialTimeout: 5 * time.Second,
+		LogConfig:   &etcdLogCfg,
 	})
 }
 
