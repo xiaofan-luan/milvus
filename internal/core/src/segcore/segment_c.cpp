@@ -55,6 +55,7 @@ void
 DeleteSegment(CSegmentInterface c_segment) {
     auto s = static_cast<milvus::segcore::SegmentInterface*>(c_segment);
     delete s;
+    malloc_trim(0);
 }
 
 void
