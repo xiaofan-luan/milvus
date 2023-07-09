@@ -126,7 +126,7 @@ func (mgr *TargetManager) updateCollectionNextTarget(collectionID int64, partiti
 	log.Debug("start to update next targets for collection")
 	newTarget, err := mgr.PullNextTarget(mgr.broker, collectionID, partitionIDs...)
 	if err != nil {
-		log.Error("failed to get next targets for collection",
+		log.Warn("failed to get next targets for collection",
 			zap.Error(err))
 		return err
 	}

@@ -773,15 +773,14 @@ func (s *Server) GetRecoveryInfoV2(ctx context.Context, req *datapb.GetRecoveryI
 		return resp, nil
 	}
 
-	dresp, err := s.broker.DescribeCollectionInternal(s.ctx, collectionID)
+	// try to use collection cache
+	collectionInfo, err := s.handler.GetCollection(s.ctx, collectionID)
 	if err != nil {
-		log.Error("get collection info from rootcoord failed",
-			zap.Error(err))
-
+		log.Warn("get collection info from rootcoord failed", zap.Error(err))
 		resp.Status.Reason = err.Error()
 		return resp, nil
 	}
-	channels := dresp.GetVirtualChannelNames()
+	channels := collectionInfo.channelNames
 	channelInfos := make([]*datapb.VchannelInfo, 0, len(channels))
 	flushedIDs := make(typeutil.UniqueSet)
 	for _, c := range channels {

@@ -1029,6 +1029,7 @@ func (s *Server) loadCollectionFromRootCoord(ctx context.Context, collectionID i
 		StartPositions: resp.GetStartPositions(),
 		Properties:     properties,
 		CreatedAt:      resp.GetCreatedTimestamp(),
+		channelNames:   resp.GetVirtualChannelNames(),
 	}
 	s.meta.AddCollection(collInfo)
 	return nil

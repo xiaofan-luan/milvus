@@ -38,9 +38,7 @@ import (
 )
 
 const (
-	distReqTimeout         = 3 * time.Second
 	heartBeatLagBehindWarn = 3 * time.Second
-	maxFailureTimes        = 3
 )
 
 type distHandler struct {
@@ -223,7 +221,7 @@ func (dh *distHandler) getDistribution(ctx context.Context) (*querypb.GetDataDis
 		channels[channel.GetChannelName()] = targetChannel.GetSeekPosition()
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, distReqTimeout)
+	ctx, cancel := context.WithTimeout(ctx, Params.QueryCoordCfg.DistPullTimeout.GetAsDuration(time.Millisecond))
 	defer cancel()
 	resp, err := dh.client.GetDataDistribution(ctx, dh.nodeID, &querypb.GetDataDistributionRequest{
 		Base: commonpbutil.NewMsgBase(

@@ -129,6 +129,7 @@ func (h *ServerHandler) GetQueryVChanPositions(channel *channel, partitionIDs ..
 	validPartitions := lo.Filter(partitionIDs, func(partitionID int64, _ int) bool { return partitionID > allPartitionID })
 	partitionSet := typeutil.NewUniqueSet(validPartitions...)
 	for _, s := range segments {
+		// skip new segment
 		if (partitionSet.Len() > 0 && !partitionSet.Contain(s.PartitionID)) ||
 			(s.GetStartPosition() == nil && s.GetDmlPosition() == nil) {
 			continue
@@ -199,6 +200,9 @@ func (h *ServerHandler) GetQueryVChanPositions(channel *channel, partitionIDs ..
 	for retrieveUnIndexed() {
 	}
 
+	// this can only happen because of compacted segemnt is not indexed and not ready for serving.
+	// still using original segment.
+	// TODO, add dropping segments should simply this logic
 	for segId := range unIndexedIDs {
 		segInfo := segmentInfos[segId]
 		if segInfo.GetState() == commonpb.SegmentState_Dropped {

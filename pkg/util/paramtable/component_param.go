@@ -215,6 +215,8 @@ type commonConfig struct {
 	SessionTTL        ParamItem `refreshable:"false"`
 	SessionRetryTimes ParamItem `refreshable:"false"`
 
+	BrokerTimeout ParamItem `refreshable:"false"`
+
 	PreCreatedTopicEnabled ParamItem `refreshable:"true"`
 	TopicNames             ParamItem `refreshable:"true"`
 	TimeTicker             ParamItem `refreshable:"true"`
@@ -603,6 +605,15 @@ like the old password verification when updating the credential`,
 		Export:       true,
 	}
 	p.SessionTTL.Init(base.mgr)
+
+	p.BrokerTimeout = ParamItem{
+		Key:          "common.coordinator.broker.timeout",
+		Version:      "2.3.0",
+		DefaultValue: "10",
+		Doc:          "coordinator broker timeout",
+		Export:       true,
+	}
+	p.BrokerTimeout.Init(base.mgr)
 
 	p.SessionRetryTimes = ParamItem{
 		Key:          "common.session.retryTimes",
@@ -1156,6 +1167,7 @@ type queryCoordConfig struct {
 	ChannelTaskTimeout                  ParamItem `refreshable:"true"`
 	SegmentTaskTimeout                  ParamItem `refreshable:"true"`
 	DistPullInterval                    ParamItem `refreshable:"false"`
+	DistPullTimeout                     ParamItem `refreshable:"false"`
 	HeartbeatAvailableInterval          ParamItem `refreshable:"true"`
 	LoadTimeoutSeconds                  ParamItem `refreshable:"true"`
 	// Deprecated: Since 2.2.2, QueryCoord do not use HandOff logic anymore
@@ -1321,13 +1333,22 @@ func (p *queryCoordConfig) init(base *BaseTable) {
 	p.SegmentTaskTimeout.Init(base.mgr)
 
 	p.DistPullInterval = ParamItem{
-		Key:          "queryCoord.distPullInterval",
+		Key:          "queryCoord.distPull.interval",
 		Version:      "2.0.0",
 		DefaultValue: "500",
 		PanicIfEmpty: true,
 		Export:       true,
 	}
 	p.DistPullInterval.Init(base.mgr)
+
+	p.DistPullTimeout = ParamItem{
+		Key:          "queryCoord.distPull.timeout",
+		Version:      "2.3.0",
+		DefaultValue: "3000",
+		PanicIfEmpty: true,
+		Export:       true,
+	}
+	p.DistPullTimeout.Init(base.mgr)
 
 	p.LoadTimeoutSeconds = ParamItem{
 		Key:          "queryCoord.loadTimeoutSeconds",

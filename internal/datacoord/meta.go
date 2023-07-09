@@ -77,6 +77,7 @@ type collectionInfo struct {
 	StartPositions []*commonpb.KeyDataPair
 	Properties     map[string]string
 	CreatedAt      Timestamp
+	channelNames   []string
 }
 
 // NewMeta creates meta from provided `kv.TxnKV`
