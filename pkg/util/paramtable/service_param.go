@@ -267,7 +267,7 @@ We recommend using version 1.2 and above.`,
 
 	p.RequestTimeout = ParamItem{
 		Key:          "etcd.requestTimeout",
-		DefaultValue: "10000",
+		DefaultValue: "30000",
 		Version:      "2.3.4",
 		Doc:          `Etcd operation timeout in milliseconds`,
 		Export:       true,

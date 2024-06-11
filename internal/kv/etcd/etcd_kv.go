@@ -35,7 +35,7 @@ import (
 
 const (
 	// defaultRequestTimeout is default timeout for etcd request.
-	defaultRequestTimeout = 10 * time.Second
+	defaultRequestTimeout = 30 * time.Second
 )
 
 // etcdKV implements TxnKV interface, it supports to process multiple kvs in a transaction.
