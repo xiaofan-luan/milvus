@@ -18,6 +18,7 @@ package msgstream
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	"github.com/milvus-io/milvus/pkg/mq/common"
@@ -46,6 +47,16 @@ type MsgPack struct {
 	Msgs           []TsMsg
 	StartPositions []*MsgPosition
 	EndPositions   []*MsgPosition
+}
+
+func MsgPositionToString(m *MsgPosition) string {
+	return fmt.Sprintf(
+		"MsgPosition{ChannelName: %s, MsgID: %x, MsgGroup: %s, Timestamp: %d}",
+		m.ChannelName,
+		m.MsgID,
+		m.MsgGroup,
+		m.Timestamp,
+	)
 }
 
 // RepackFunc is a function type which used to repack message after hash by primary key
