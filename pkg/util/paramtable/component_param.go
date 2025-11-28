@@ -3506,10 +3506,10 @@ If set to 0, time based eviction is disabled.`,
 	p.KnowhereThreadPoolSize = ParamItem{
 		Key:          "queryNode.segcore.knowhereThreadPoolNumRatio",
 		Version:      "2.0.0",
-		DefaultValue: "4",
+		DefaultValue: "2",
 		Formatter: func(v string) string {
 			factor := getAsFloat(v)
-			if factor <= 0 || !p.EnableDisk.GetAsBool() {
+			if factor <= 0 {
 				factor = 1
 			} else if factor > 32 {
 				factor = 32

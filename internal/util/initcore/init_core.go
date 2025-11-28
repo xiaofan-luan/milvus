@@ -433,16 +433,7 @@ func SetupCoreConfigChangelCallback() {
 		})
 
 		paramtable.Get().QueryNodeCfg.KnowhereThreadPoolSize.RegisterCallback(func(ctx context.Context, key, oldValue, newValue string) error {
-			factor, err := strconv.ParseFloat(newValue, 64)
-			if err != nil {
-				return err
-			}
-			if factor <= 0 || !paramtable.Get().QueryNodeCfg.EnableDisk.GetAsBool() {
-				factor = 1
-			} else if factor > 32 {
-				factor = 32
-			}
-			knowhereThreadPoolSize := uint32(float64(hardware.GetCPUNum()) * factor)
+			knowhereThreadPoolSize := paramtable.Get().QueryNodeCfg.KnowhereThreadPoolSize.GetAsUint32()
 			log.Info("UpdateKnowhereThreadPoolSize", zap.Uint32("knowhereThreadPoolSize", knowhereThreadPoolSize))
 			C.SegcoreSetKnowhereSearchThreadPoolNum(C.uint32_t(knowhereThreadPoolSize))
 			return nil

@@ -72,6 +72,7 @@ func doInitQueryNodeOnce(ctx context.Context) error {
 	C.SegcoreSetChunkRows(cChunkRows)
 
 	cKnowhereThreadPoolSize := C.uint32_t(paramtable.Get().QueryNodeCfg.KnowhereThreadPoolSize.GetAsUint32())
+	log.Ctx(ctx).Info("InitKnowhereThreadPoolSize", zap.Uint32("knowhereThreadPoolSize", cKnowhereThreadPoolSize))
 	C.SegcoreSetKnowhereSearchThreadPoolNum(cKnowhereThreadPoolSize)
 
 	cKnowhereFetchThreadPoolSize := C.uint32_t(paramtable.Get().QueryNodeCfg.KnowhereFetchThreadPoolSize.GetAsUint32())
