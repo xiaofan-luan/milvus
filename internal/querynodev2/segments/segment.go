@@ -609,7 +609,7 @@ func (s *LocalSegment) Search(ctx context.Context, searchReq *segcore.SearchRequ
 	tr := timerecord.NewTimeRecorder("cgoSearch")
 	result, err := s.csegment.Search(ctx, searchReq)
 	if err != nil {
-		log.Warn("Search failed")
+		log.Warn("Search failed", zap.Error(err))
 		return nil, err
 	}
 	metrics.QueryNodeSQSegmentLatencyInCore.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.SearchLabel).Observe(float64(tr.ElapseSpan().Milliseconds()))
