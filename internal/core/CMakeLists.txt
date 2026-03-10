@@ -138,8 +138,13 @@ if (LINUX OR MSYS)
                   "-Wno-error"
                   "-Wno-all"
                   )
-    if (USE_ASAN STREQUAL "ON") 
+    if (USE_ASAN STREQUAL "ON")
         message( STATUS "Building Milvus Core Using AddressSanitizer")
+        # Downgrade -O3 to -O2 for ASAN builds: ASAN inflates IR ~2-3x per
+        # compilation unit, and -O3's aggressive passes on top cause excessive
+        # peak memory in CI. Patching CMAKE_CXX_FLAGS_RELEASE here keeps the
+        # optimization level controlled in a single place.
+        string(REPLACE "-O3" "-O2" CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE}")
         add_compile_options(-fno-stack-protector -fno-omit-frame-pointer -fno-var-tracking -fsanitize=address)
         add_link_options(-fno-stack-protector -fno-omit-frame-pointer -fno-var-tracking -fsanitize=address)
     endif()
