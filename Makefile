@@ -418,7 +418,7 @@ codecov-go: build-cpp-with-coverage
 # Run codecov-go without build core again, used in github action
 codecov-go-without-build: getdeps
 	@echo "Running go coverage..."
-	@(env bash $(PWD)/scripts/run_go_codecov.sh "$(INSTALL_PATH)/gotestsum --")
+	@(env bash $(PWD)/scripts/run_go_codecov.sh "$(INSTALL_PATH)/gotestsum --packages ./... --")
 
 # Run codecov-cpp
 codecov-cpp: build-cpp-with-coverage
