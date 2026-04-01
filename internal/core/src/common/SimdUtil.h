@@ -80,7 +80,7 @@ struct BitMask<T, A, 1> {
 #if XSIMD_WITH_NEON
     static uint64_t
     toBitMask(xsimd::batch_bool<T, A> mask, const xsimd::neon&) {
-        static const alignas(16) int8_t kShift[] = {
+        alignas(16) static const int8_t kShift[] = {
             -7, -6, -5, -4, -3, -2, -1, 0, -7, -6, -5, -4, -3, -2, -1, 0};
         int8x16_t vshift = vld1q_s8(kShift);
         uint8x16_t vmask = vshlq_u8(vandq_u8(mask, vdupq_n_u8(0x80)), vshift);
@@ -136,8 +136,8 @@ struct BitMask<T, A, 2> {
         uint16x8_t u16 = vreinterpretq_u16_u8(static_cast<uint8x16_t>(mask));
         uint8x8_t narrowed = vshrn_n_u16(u16, 8);
         // 8 bytes → 8 bits via shift-and-add
-        static const alignas(8)
-            int8_t kShift[] = {-7, -6, -5, -4, -3, -2, -1, 0};
+        alignas(8) static const int8_t kShift[] = {
+            -7, -6, -5, -4, -3, -2, -1, 0};
         int8x8_t vshift = vld1_s8(kShift);
         uint8x8_t bits = vshl_u8(vand_u8(narrowed, vdup_n_u8(0x80)), vshift);
         return vaddv_u8(bits);
@@ -195,7 +195,7 @@ struct BitMask<T, A, 4> {
     toBitMask(xsimd::batch_bool<T, A> mask, const xsimd::neon&) {
         uint32x4_t u32 = vreinterpretq_u32_u8(static_cast<uint8x16_t>(mask));
         uint32x4_t bits = vshrq_n_u32(u32, 31);
-        static const alignas(16) int32_t kShift[] = {0, 1, 2, 3};
+        alignas(16) static const int32_t kShift[] = {0, 1, 2, 3};
         int32x4_t shifts = vld1q_s32(kShift);
         uint32x4_t weighted = vshlq_u32(bits, shifts);
         return vaddvq_u32(weighted);

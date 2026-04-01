@@ -320,9 +320,7 @@ class SetElement : public MultiElement {
     // Looks up each data[i] directly in the hash set (zero-copy for strings
     // via transparent hash).
     void
-    FilterChunk(const T* data,
-                const int size,
-                TargetBitmapView res) const {
+    FilterChunk(const T* data, const int size, TargetBitmapView res) const {
         for (int i = 0; i < size; ++i) {
             if constexpr (std::is_same_v<T, std::string>) {
                 // Use string_view to avoid copying into the hash function
@@ -426,11 +424,12 @@ class SimdBatchElement : public MultiElement {
         }
 
         int offset = res.offset();
+        int bit_offset = offset % 8;
         int start = 0;
 
         // Head: scalar for unaligned leading bits (up to 7 rows)
-        if (offset != 0) {
-            int head = std::min(size, 8 - offset);
+        if (bit_offset != 0) {
+            int head = std::min(size, 8 - bit_offset);
             for (int i = 0; i < head; ++i) {
                 if (std::binary_search(vals_.begin(), vals_.end(), data[i])) {
                     res[i] = true;
@@ -457,7 +456,6 @@ class SimdBatchElement : public MultiElement {
         return vals_;
     }
 };
-
 
 // ═══════════════════════════════════════════════════════════════════════════
 // GetElementValues: extract typed element vector from any MultiElement.

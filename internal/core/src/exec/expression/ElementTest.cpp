@@ -894,7 +894,6 @@ TEST(SingleElementTest, SetAndGetDouble) {
 // P1: SimdBatchElement dedup — duplicates in IN list should be removed
 // ═══════════════════════════════════════════════════════════════════════════
 
-
 TEST(FilterChunkTest, DeduplicatedFilterChunk) {
     // FilterChunk with duplicated IN vals should produce same result
     std::vector<int32_t> vals_dup = {42, 42, 42, 7, 7};
@@ -1153,8 +1152,8 @@ TEST(FilterChunkTest, AllSameDataNoMatch) {
 }
 
 TEST(FilterChunkTest, LargeInListNearThreshold) {
-    // IN list size = 63 (just below kSimdThreshold=64), still uses SIMD path
-    constexpr int kInSize = 63;
+    // IN list size = 31 (just below kSimdThreshold=32 on AVX2 int32), still uses SIMD path
+    constexpr int kInSize = 31;
     std::vector<int32_t> in_vals(kInSize);
     for (int i = 0; i < kInSize; ++i) {
         in_vals[i] = i * 3;  // 0, 3, 6, 9, ...
@@ -1507,7 +1506,6 @@ TEST(FlatVectorElementTest, SingleValue) {
 // SimdBatchElement — all-duplicates IN list
 // ═══════════════════════════════════════════════════════════════════════════
 
-
 // ═══════════════════════════════════════════════════════════════════════════
 // SingleElement — additional type coverage
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1796,11 +1794,10 @@ VerifyFilterChunkVaryingSizes(const std::string& label) {
             for (int i = 0; i < data_sz; ++i) {
                 data[i] = static_cast<T>(i % 512);
             }
-            VerifyFilterChunk(
-                in_vals,
-                data,
-                label + " in=" + std::to_string(in_sz) +
-                    " data=" + std::to_string(data_sz));
+            VerifyFilterChunk(in_vals,
+                              data,
+                              label + " in=" + std::to_string(in_sz) +
+                                  " data=" + std::to_string(data_sz));
         }
     }
 }

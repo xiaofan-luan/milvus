@@ -1017,8 +1017,7 @@ PhyTermFilterExpr::ExecVisitorImplForData(EvalCtx& context) {
                 arg_set_ =
                     std::make_shared<FlatVectorElement<std::string>>(str_vals);
             } else {
-                arg_set_ =
-                    std::make_shared<SetElement<std::string>>(str_vals);
+                arg_set_ = std::make_shared<SetElement<std::string>>(str_vals);
             }
         } else if constexpr (std::is_same_v<T, bool>) {
             // Bool IN has at most 2 distinct values; linear scan is O(1).
@@ -1027,13 +1026,13 @@ PhyTermFilterExpr::ExecVisitorImplForData(EvalCtx& context) {
             // All numeric types: SIMD for small IN, hash for large IN.
             // Crossover benchmarked with ankerl hash at load_factor=0.5.
             // Automatically adapts to all architectures:
-            //   AVX512 int32 (kLanes=16): threshold=128
-            //   AVX2   int32 (kLanes=8):  threshold=64
-            //   AVX2   int64 (kLanes=4):  threshold=32
-            //   NEON   int32 (kLanes=4):  threshold=32
-            //   NEON   int64 (kLanes=2):  threshold=16
+            //   AVX512 int32 (kLanes=16): threshold=64
+            //   AVX2   int32 (kLanes=8):  threshold=32
+            //   AVX2   int64 (kLanes=4):  threshold=16
+            //   NEON   int32 (kLanes=4):  threshold=16
+            //   NEON   int64 (kLanes=2):  threshold=8
             const size_t kSimdThreshold =
-                static_cast<size_t>(simdLaneCount<T>()) * 8;
+                static_cast<size_t>(simdLaneCount<T>()) * 4;
             if (vals.size() <= kSimdThreshold) {
                 arg_set_ = std::make_shared<SimdBatchElement<T>>(vals);
             } else {
@@ -1073,7 +1072,7 @@ PhyTermFilterExpr::ExecVisitorImplForData(EvalCtx& context) {
     int processed_cursor = 0;
     auto execute_sub_batch =
         [&processed_cursor, &bitmap_input, &simd_filter_fn,
-         str_set_elem]<FilterType filter_type = FilterType::sequential>(
+         str_set_elem ]<FilterType filter_type = FilterType::sequential>(
             const T* data,
             const bool* valid_data,
             const int32_t* offsets,
@@ -1131,13 +1130,12 @@ PhyTermFilterExpr::ExecVisitorImplForData(EvalCtx& context) {
                           std::is_same_v<T, std::string_view>) {
                 if (str_set_elem) {
                     // Hash lookup via string_view (zero copy)
-                    res[i] = str_set_elem->values_.find(
-                                 std::string_view(data[offset])) !=
-                             str_set_elem->values_.end();
+                    res[i] = str_set_elem->values_.find(std::string_view(
+                                 data[offset])) != str_set_elem->values_.end();
                 } else {
                     // FlatVectorElement path (small IN ≤4)
-                    res[i] = vals->In(
-                        MultiElement::ValueType(std::string_view(data[offset])));
+                    res[i] = vals->In(MultiElement::ValueType(
+                        std::string_view(data[offset])));
                 }
             } else {
                 res[i] = vals->In(MultiElement::ValueType(data[offset]));
