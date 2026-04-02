@@ -80,12 +80,27 @@ struct BitMask<T, A, 1> {
 #if XSIMD_WITH_NEON
     static uint64_t
     toBitMask(xsimd::batch_bool<T, A> mask, const xsimd::neon&) {
-        alignas(16) static const int8_t kShift[] = {
-            -7, -6, -5, -4, -3, -2, -1, 0, -7, -6, -5, -4, -3, -2, -1, 0};
-        int8x16_t vshift = vld1q_s8(kShift);
-        uint8x16_t vmask = vshlq_u8(vandq_u8(mask, vdupq_n_u8(0x80)), vshift);
-        return (vaddv_u8(vget_high_u8(vmask)) << 8) |
-               vaddv_u8(vget_low_u8(vmask));
+        // Safe NEON path: build bitmask from a stored 0/1 byte vector.
+        constexpr size_t lanes = xsimd::batch_bool<T, A>::size;
+        if constexpr (lanes == 16) {
+            alignas(16) T values[lanes];
+            auto ones = xsimd::batch<T, A>(T(1));
+            auto zeros = xsimd::batch<T, A>(T(0));
+            auto int_batch = xsimd::select(mask, ones, zeros);
+            int_batch.store_aligned(values);
+
+            uint8x16_t v = vld1q_u8(reinterpret_cast<const uint8_t*>(values));
+            // Shift each lane by its lane index: [0..7, 0..7]
+            static const int8_t kShiftArr[16] = {0,1,2,3,4,5,6,7, 0,1,2,3,4,5,6,7};
+            int8x16_t shifts = vld1q_s8(kShiftArr);
+            uint8x16_t shifted = vshlq_u8(v, shifts);
+            // Sum halves to form 8-bit masks and combine into 16-bit result
+            uint8_t low = vaddv_u8(vget_low_u8(shifted));
+            uint8_t high = vaddv_u8(vget_high_u8(shifted));
+            return static_cast<uint64_t>(low) | (static_cast<uint64_t>(high) << 8);
+        } else {
+            return genericToBitMask(mask);
+        }
     }
 #endif
 
@@ -132,15 +147,22 @@ struct BitMask<T, A, 2> {
 #if XSIMD_WITH_NEON
     static uint64_t
     toBitMask(xsimd::batch_bool<T, A> mask, const xsimd::neon&) {
-        // Narrow: top byte of each 16-bit all-1s/all-0s lane → 0xFF/0x00
-        uint16x8_t u16 = vreinterpretq_u16_u8(static_cast<uint8x16_t>(mask));
-        uint8x8_t narrowed = vshrn_n_u16(u16, 8);
-        // 8 bytes → 8 bits via shift-and-add
-        alignas(8) static const int8_t kShift[] = {
-            -7, -6, -5, -4, -3, -2, -1, 0};
-        int8x8_t vshift = vld1_s8(kShift);
-        uint8x8_t bits = vshl_u8(vand_u8(narrowed, vdup_n_u8(0x80)), vshift);
-        return vaddv_u8(bits);
+        // Safe NEON path for 8 lanes (int16_t):
+        // 1) convert to 0/1 u16 values via select+store
+        // 2) narrow to u8, shift by lane index [0..7], horizontal add
+        alignas(16) T values[8];
+        auto ones = xsimd::batch<T, A>(T(1));
+        auto zeros = xsimd::batch<T, A>(T(0));
+        auto int_batch = xsimd::select(mask, ones, zeros);
+        int_batch.store_aligned(values);
+
+        uint16x8_t v16 = vld1q_u16(reinterpret_cast<const uint16_t*>(values));
+        uint8x8_t v8 = vqmovn_u16(v16);
+        static const int8_t kShift8[8] = {0,1,2,3,4,5,6,7};
+        int8x8_t shifts = vld1_s8(kShift8);
+        uint8x8_t shifted = vshl_u8(v8, shifts);
+        uint8_t mask8 = vaddv_u8(shifted);
+        return static_cast<uint64_t>(mask8);
     }
 #endif
 
@@ -154,7 +176,7 @@ struct BitMask<T, A, 2> {
 // sizeof(T) == 4  (int32_t / float)
 // AVX512F:  __mmask16 — direct extract (only needs Foundation, not BW).
 // AVX:      _mm256_movemask_ps → 8 bits, 1 per float lane.
-// NEON:     high-bit shift + positional weighting + horizontal add.
+// NEON:     generic fallback (batch_bool cast unavailable).
 // ═══════════════════════════════════════════════════════════════════════════
 template <typename T, typename A>
 struct BitMask<T, A, 4> {
@@ -193,12 +215,7 @@ struct BitMask<T, A, 4> {
 #if XSIMD_WITH_NEON
     static uint64_t
     toBitMask(xsimd::batch_bool<T, A> mask, const xsimd::neon&) {
-        uint32x4_t u32 = vreinterpretq_u32_u8(static_cast<uint8x16_t>(mask));
-        uint32x4_t bits = vshrq_n_u32(u32, 31);
-        alignas(16) static const int32_t kShift[] = {0, 1, 2, 3};
-        int32x4_t shifts = vld1q_s32(kShift);
-        uint32x4_t weighted = vshlq_u32(bits, shifts);
-        return vaddvq_u32(weighted);
+        return genericToBitMask(mask);
     }
 #endif
 
@@ -212,7 +229,7 @@ struct BitMask<T, A, 4> {
 // sizeof(T) == 8  (int64_t / double)
 // AVX512F:  __mmask8 — direct extract (only needs Foundation, not BW).
 // AVX:      _mm256_movemask_pd → 4 bits, 1 per double lane.
-// NEON:     extract high bit of each 64-bit lane (only 2 lanes).
+// NEON:     generic fallback (batch_bool cast unavailable).
 // ═══════════════════════════════════════════════════════════════════════════
 template <typename T, typename A>
 struct BitMask<T, A, 8> {
@@ -251,9 +268,28 @@ struct BitMask<T, A, 8> {
 #if XSIMD_WITH_NEON
     static uint64_t
     toBitMask(xsimd::batch_bool<T, A> mask, const xsimd::neon&) {
-        uint64x2_t u64 = vreinterpretq_u64_u8(static_cast<uint8x16_t>(mask));
-        return (vgetq_lane_u64(u64, 0) >> 63) |
-               ((vgetq_lane_u64(u64, 1) >> 63) << 1);
+        // Safe NEON path for 2 lanes (int64/double):
+        // 1) convert to 0/1 via select+store
+        // 2) shift lane 1 by 1, OR both lanes
+        alignas(16) T values[2];
+        auto ones = xsimd::batch<T, A>(T(1));
+        auto zeros = xsimd::batch<T, A>(T(0));
+        auto int_batch = xsimd::select(mask, ones, zeros);
+        int_batch.store_aligned(values);
+
+        uint64x2_t v01;
+        if constexpr (std::is_floating_point_v<T>) {
+            float64x2_t vf = vld1q_f64(reinterpret_cast<const double*>(values));
+            // vf > 0.0 -> all ones, else zeros; normalize to 0/1 by >>63
+            uint64x2_t vm = vreinterpretq_u64_u64(vcgtq_f64(vf, vdupq_n_f64(0.0)));
+            v01 = vshrq_n_u64(vm, 63);
+        } else {
+            v01 = vld1q_u64(reinterpret_cast<const uint64_t*>(values));
+        }
+        static const int64_t kShiftArr2[2] = {0, 1};
+        int64x2_t shifts = vld1q_s64(kShiftArr2);
+        uint64x2_t shifted = vshlq_u64(v01, shifts);
+        return vgetq_lane_u64(shifted, 0) | vgetq_lane_u64(shifted, 1);
     }
 #endif
 

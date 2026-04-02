@@ -358,10 +358,76 @@ class SetElement : public MultiElement {
     SetType values_;
 };
 
-// Note: SetElement<bool> specialization was removed. Bool IN expressions are
-// rewritten to equality or always-true/always-false at the proxy layer
-// (rewriter/entry.go), so TermExpr never receives a bool IN list.
-// The generic SetElement<bool> (ankerl hash set) works as fallback if needed.
+// SetElement<bool> specialization: avoids ankerl::unordered_dense::set<bool>
+// which triggers ASan stack-use-after-scope due to std::vector<bool> proxy
+// iterator issues.  Bool IN expressions are rewritten at the proxy layer
+// (rewriter/entry.go), so this is only a fallback.
+template <>
+class SetElement<bool> : public MultiElement {
+ public:
+    explicit SetElement(const std::vector<proto::plan::GenericValue>& values) {
+        for (auto& value : values) {
+            bool v = GetValueFromProto<bool>(value);
+            if (v) {
+                contains_true_ = true;
+            } else {
+                contains_false_ = true;
+            }
+        }
+    }
+
+    explicit SetElement(const std::vector<bool>& values) {
+        for (const auto& value : values) {
+            if (value) {
+                contains_true_ = true;
+            } else {
+                contains_false_ = true;
+            }
+        }
+    }
+
+    bool
+    Empty() const override {
+        return !contains_true_ && !contains_false_;
+    }
+
+    bool
+    In(const ValueType& value) const override {
+        if (std::holds_alternative<bool>(value)) {
+            bool v = std::get<bool>(value);
+            return (v && contains_true_) || (!v && contains_false_);
+        }
+        return false;
+    }
+
+    void
+    AddElement(const bool& value) {
+        if (value) {
+            contains_true_ = true;
+        } else {
+            contains_false_ = true;
+        }
+    }
+
+    size_t
+    Size() const override {
+        return (contains_true_ ? 1 : 0) + (contains_false_ ? 1 : 0);
+    }
+
+    std::vector<bool>
+    GetElements() const {
+        std::vector<bool> result;
+        if (contains_true_)
+            result.push_back(true);
+        if (contains_false_)
+            result.push_back(false);
+        return result;
+    }
+
+ private:
+    bool contains_true_ = false;
+    bool contains_false_ = false;
+};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SimdBatchElement: SIMD batch-data comparison for all numeric types.
@@ -409,7 +475,7 @@ class SimdBatchElement : public MultiElement {
         return vals_.size();
     }
 
-    // Per-row fallback: binary search (vals_ is pre-sorted by Go rewriter)
+    // Per-row fallback: binary search (vals_ is expected sorted by Go rewriter)
     bool
     In(const ValueType& value) const override {
         T v = std::get<T>(value);

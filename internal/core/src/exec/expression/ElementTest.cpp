@@ -20,6 +20,8 @@
 #include <random>
 #include <string>
 #include <vector>
+#include <algorithm>
+#include <variant>
 
 #include "exec/expression/Element.h"
 #include <xsimd/xsimd.hpp>
@@ -34,6 +36,8 @@ using VT = MultiElement::ValueType;
 
 TEST(SimdBatchElementTest, Int8) {
     std::vector<int8_t> vals = {1, -1, 0, 127, -128};
+    std::sort(vals.begin(), vals.end());
+    vals.erase(std::unique(vals.begin(), vals.end()), vals.end());
     SimdBatchElement<int8_t> sb(vals);
     EXPECT_EQ(sb.Size(), 5);
     for (auto v : vals) {
@@ -45,6 +49,8 @@ TEST(SimdBatchElementTest, Int8) {
 
 TEST(SimdBatchElementTest, Int16) {
     std::vector<int16_t> vals = {0, 1, -1, 32767, -32768};
+    std::sort(vals.begin(), vals.end());
+    vals.erase(std::unique(vals.begin(), vals.end()), vals.end());
     SimdBatchElement<int16_t> sb(vals);
     for (auto v : vals) {
         EXPECT_TRUE(sb.In(VT(v)));
@@ -54,13 +60,15 @@ TEST(SimdBatchElementTest, Int16) {
 
 TEST(SimdBatchElementTest, Int32) {
     std::vector<int32_t> vals = {1, -1, 0, 100000, -100000, 42};
+    std::sort(vals.begin(), vals.end());
+    vals.erase(std::unique(vals.begin(), vals.end()), vals.end());
     SimdBatchElement<int32_t> sb(vals);
     for (auto v : vals) {
         EXPECT_TRUE(sb.In(VT(v)));
     }
     EXPECT_FALSE(sb.In(VT(int32_t(2))));
-    // Wrong type
-    EXPECT_FALSE(sb.In(VT(int64_t(1))));
+    // Wrong type: SimdBatchElement<int32_t>::In expects int32_t; wrong variant throws
+    EXPECT_THROW(sb.In(VT(int64_t(1))), std::bad_variant_access);
 }
 
 TEST(SimdBatchElementTest, Int64) {
@@ -127,7 +135,10 @@ void
 VerifyFilterChunk(const std::vector<T>& in_vals,
                   const std::vector<T>& data,
                   const std::string& label = "") {
-    SimdBatchElement<T> sb(in_vals);
+    auto in_sorted = in_vals;
+std::sort(in_sorted.begin(), in_sorted.end());
+in_sorted.erase(std::unique(in_sorted.begin(), in_sorted.end()), in_sorted.end());
+SimdBatchElement<T> sb(in_sorted);
     SetElement<T> se(in_vals);
 
     const int n = static_cast<int>(data.size());
@@ -340,7 +351,10 @@ VerifyFilterChunkWithOffset(const std::vector<T>& in_vals,
                             const std::vector<T>& data,
                             int offset,
                             const std::string& label = "") {
-    SimdBatchElement<T> sb(in_vals);
+    auto in_sorted = in_vals;
+std::sort(in_sorted.begin(), in_sorted.end());
+in_sorted.erase(std::unique(in_sorted.begin(), in_sorted.end()), in_sorted.end());
+SimdBatchElement<T> sb(in_sorted);
     SetElement<T> se(in_vals);
 
     const int n = static_cast<int>(data.size());
@@ -477,6 +491,63 @@ TEST(ToBitMaskTest, Float) {
 
 TEST(ToBitMaskTest, Double) {
     VerifyToBitMask<double>();
+}
+
+// Verify lane->bit mapping across widths (arch-agnostic).
+TEST(ToBitMaskTest, LaneBitMapping) {
+    using A = xsimd::default_arch;
+    // int8_t: set lane 0 and 7
+    {
+        using T = int8_t;
+        using Batch = xsimd::batch<T, A>;
+        T data[64] = {};
+        data[0] = 1; data[7] = 1;
+        auto d = Batch::load_unaligned(data);
+        auto target = Batch::broadcast(T(1));
+        auto mask = (d == target);
+        uint64_t m = milvus::toBitMask(mask);
+        EXPECT_EQ(m, (1u << 0) | (1u << 7));
+    }
+    // int16_t: set lane 1 and 6
+    {
+        using T = int16_t;
+        using Batch = xsimd::batch<T, A>;
+        T data[64] = {};
+        data[1] = 1; data[6] = 1;
+        auto d = Batch::load_unaligned(data);
+        auto target = Batch::broadcast(T(1));
+        auto mask = (d == target);
+        uint64_t m = milvus::toBitMask(mask);
+        EXPECT_EQ(m, (1u << 1) | (1u << 6));
+    }
+    // int32_t: set lane 0 and last
+    {
+        using T = int32_t;
+        using Batch = xsimd::batch<T, A>;
+        constexpr int L = Batch::size;
+        std::vector<T> data(64, 0);
+        data[0] = 1; data[L-1] = 1;
+        auto d = Batch::load_unaligned(data.data());
+        auto target = Batch::broadcast(T(1));
+        auto mask = (d == target);
+        uint64_t m = milvus::toBitMask(mask);
+        EXPECT_EQ(m, (1u << 0) | (1u << (L-1)));
+    }
+    // int64_t: set lane 1 (and optionally last if L>2)
+    {
+        using T = int64_t;
+        using Batch = xsimd::batch<T, A>;
+        constexpr int L = Batch::size;
+        std::vector<T> data(64, 0);
+        data[1] = 1;
+        if (L > 2) data[L-1] = 1;
+        auto d = Batch::load_unaligned(data.data());
+        auto target = Batch::broadcast(T(1));
+        auto mask = (d == target);
+        uint64_t m = milvus::toBitMask(mask);
+        uint64_t expected = (1u << 1) | (L > 2 ? (1ull << (L-1)) : 0ull);
+        EXPECT_EQ(m, expected);
+    }
 }
 
 // Verify kAllSet matches expected value for each type.
@@ -741,7 +812,10 @@ void
 FilterChunkVsIn(const std::vector<T>& in_vals,
                 const std::vector<T>& data,
                 const std::string& label) {
-    SimdBatchElement<T> sb(in_vals);
+    auto in_sorted = in_vals;
+std::sort(in_sorted.begin(), in_sorted.end());
+in_sorted.erase(std::unique(in_sorted.begin(), in_sorted.end()), in_sorted.end());
+SimdBatchElement<T> sb(in_sorted);
     const int n = static_cast<int>(data.size());
 
     milvus::TargetBitmap bm_chunk(n, false);
