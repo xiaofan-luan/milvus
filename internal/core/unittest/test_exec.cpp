@@ -831,3 +831,402 @@ TEST(TaskTest, SkipIndexWithBitmapInputAlignment) {
     // With the fix: 1 row should match correctly.
     EXPECT_EQ(num_matched, 1);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TermExpr SkipIndex integration test
+//
+// Verifies that TermExpr (IN filter) works correctly with SkipIndex on
+// sealed segments with multiple chunks, for all scalar data types.
+//
+// Setup per type:
+//   chunk 0: values [0..chunk_size)      — does NOT overlap IN list
+//   chunk 1: values [chunk_size..2*chunk_size) — contains IN targets
+//
+// SkipIndex should allow chunk 0 to be skipped (its min/max range excludes
+// all IN values), while chunk 1 must be scanned.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Helper: create a FieldData of type T, fill it, and return it.
+// For vector types, pass dim > 1 so num_rows = values.size() / dim.
+template <typename T>
+static FieldDataPtr
+MakeFieldData(DataType dt, const std::vector<T>& values, int dim = 1) {
+    auto num_rows = static_cast<int64_t>(values.size()) / dim;
+    auto fd =
+        storage::CreateFieldData(dt, DataType::NONE, false, dim, num_rows);
+    if constexpr (std::is_same_v<T, bool>) {
+        std::vector<uint8_t> buf(values.size());
+        for (size_t i = 0; i < values.size(); i++) buf[i] = values[i] ? 1 : 0;
+        fd->FillFieldData(buf.data(), static_cast<ssize_t>(num_rows));
+    } else {
+        fd->FillFieldData(values.data(), static_cast<ssize_t>(num_rows));
+    }
+    return fd;
+}
+
+// Helper: load a field with two chunks into a sealed segment.
+static void
+LoadTwoChunkField(SegmentSealed* segment,
+                  int64_t field_id,
+                  FieldDataPtr chunk0,
+                  FieldDataPtr chunk1) {
+    auto cm = storage::RemoteChunkManagerSingleton::GetInstance()
+                  .GetRemoteChunkManager();
+    auto load_info = PrepareSingleFieldInsertBinlog(kCollectionID,
+                                                    kPartitionID,
+                                                    kSegmentID,
+                                                    field_id,
+                                                    {chunk0, chunk1},
+                                                    cm);
+    segment->LoadFieldData(load_info);
+}
+
+// Helper: build a TermFilterExpr with int64 IN values.
+static expr::TypedExprPtr
+MakeTermExprInt64(FieldId fid,
+                  DataType dt,
+                  const std::vector<int64_t>& values) {
+    std::vector<proto::plan::GenericValue> vals;
+    for (auto v : values) {
+        proto::plan::GenericValue gv;
+        gv.set_int64_val(v);
+        vals.push_back(gv);
+    }
+    return std::make_shared<expr::TermFilterExpr>(expr::ColumnInfo(fid, dt),
+                                                  vals);
+}
+
+static expr::TypedExprPtr
+MakeTermExprFloat(FieldId fid, DataType dt, const std::vector<double>& values) {
+    std::vector<proto::plan::GenericValue> vals;
+    for (auto v : values) {
+        proto::plan::GenericValue gv;
+        gv.set_float_val(v);
+        vals.push_back(gv);
+    }
+    return std::make_shared<expr::TermFilterExpr>(expr::ColumnInfo(fid, dt),
+                                                  vals);
+}
+
+static expr::TypedExprPtr
+MakeTermExprBool(FieldId fid, const std::vector<bool>& values) {
+    std::vector<proto::plan::GenericValue> vals;
+    for (auto v : values) {
+        proto::plan::GenericValue gv;
+        gv.set_bool_val(v);
+        vals.push_back(gv);
+    }
+    return std::make_shared<expr::TermFilterExpr>(
+        expr::ColumnInfo(fid, DataType::BOOL), vals);
+}
+
+static expr::TypedExprPtr
+MakeTermExprString(FieldId fid, const std::vector<std::string>& values) {
+    std::vector<proto::plan::GenericValue> vals;
+    for (auto& v : values) {
+        proto::plan::GenericValue gv;
+        gv.set_string_val(v);
+        vals.push_back(gv);
+    }
+    return std::make_shared<expr::TermFilterExpr>(
+        expr::ColumnInfo(fid, DataType::VARCHAR), vals);
+}
+
+// Run a filter expression on a segment and return the number of matched rows.
+static int64_t
+RunFilterAndCountMatches(SegmentSealed* segment,
+                         expr::TypedExprPtr expr,
+                         int64_t total_rows) {
+    std::vector<milvus::plan::PlanNodePtr> sources;
+    auto filter_node = std::make_shared<milvus::plan::FilterBitsNode>(
+        "plannode id 1", expr, sources);
+    auto plan = plan::PlanFragment(filter_node);
+    auto query_context = std::make_shared<milvus::exec::QueryContext>(
+        "test_term_skip_index",
+        segment,
+        total_rows,
+        MAX_TIMESTAMP,
+        0,
+        0,
+        query::PlanOptions{false},
+        std::make_shared<milvus::exec::QueryConfig>(
+            std::unordered_map<std::string, std::string>{}));
+    auto task = Task::Create("task_term_skip", plan, 0, query_context);
+
+    int64_t total = 0;
+    int64_t filtered = 0;
+    for (;;) {
+        auto result = task->Next();
+        if (!result)
+            break;
+        auto col = std::dynamic_pointer_cast<ColumnVector>(result->child(0));
+        if (col && col->IsBitmap()) {
+            TargetBitmapView view(col->GetRawData(), col->size());
+            total += col->size();
+            filtered += view.count();
+        }
+    }
+    // count() returns filtered-out rows; matched = total - filtered
+    return total - filtered;
+}
+
+TEST(TaskTest, TermExprSkipIndexMultiType) {
+    const int chunk_size = 100;
+    const int total_rows = chunk_size * 2;
+
+    auto schema = std::make_shared<Schema>();
+    auto dim = 4;
+    auto vec_fid =
+        schema->AddDebugField("fakeVec", DataType::VECTOR_FLOAT, dim, "L2");
+    auto pk_fid = schema->AddDebugField("pk", DataType::INT64);
+    schema->set_primary_field_id(pk_fid);
+    auto bool_fid = schema->AddDebugField("bool_field", DataType::BOOL);
+    auto int8_fid = schema->AddDebugField("int8_field", DataType::INT8);
+    auto int16_fid = schema->AddDebugField("int16_field", DataType::INT16);
+    auto int32_fid = schema->AddDebugField("int32_field", DataType::INT32);
+    auto int64_fid = schema->AddDebugField("int64_field", DataType::INT64);
+    auto float_fid = schema->AddDebugField("float_field", DataType::FLOAT);
+    auto double_fid = schema->AddDebugField("double_field", DataType::DOUBLE);
+    auto string_fid = schema->AddDebugField("string_field", DataType::VARCHAR);
+
+    auto segment = CreateSealedSegment(schema);
+
+    // ── Build chunk data ──
+    // chunk 0: values in [0, chunk_size), no overlap with IN list targets
+    // chunk 1: values in [chunk_size, 2*chunk_size), IN targets are here
+
+    // Bool: chunk0 = all false, chunk1 = all true
+    std::vector<bool> bool_c0(chunk_size, false);
+    std::vector<bool> bool_c1(chunk_size, true);
+
+    // Int8: chunk0 = [0..49], chunk1 = [50..99]
+    // IN targets: {55, 60} — only in chunk1
+    std::vector<int8_t> int8_c0(chunk_size), int8_c1(chunk_size);
+    for (int i = 0; i < chunk_size; i++) {
+        int8_c0[i] = static_cast<int8_t>(i % 50);         // 0..49 repeated
+        int8_c1[i] = static_cast<int8_t>(50 + (i % 50));  // 50..99 repeated
+    }
+
+    // Int16/32/64: chunk0 = [0..99], chunk1 = [1000..1099]
+    std::vector<int16_t> i16_c0(chunk_size), i16_c1(chunk_size);
+    std::vector<int32_t> i32_c0(chunk_size), i32_c1(chunk_size);
+    std::vector<int64_t> i64_c0(chunk_size), i64_c1(chunk_size);
+    for (int i = 0; i < chunk_size; i++) {
+        i16_c0[i] = static_cast<int16_t>(i);
+        i16_c1[i] = static_cast<int16_t>(1000 + i);
+        i32_c0[i] = i;
+        i32_c1[i] = 1000 + i;
+        i64_c0[i] = i;
+        i64_c1[i] = 1000 + i;
+    }
+
+    // Float/Double: chunk0 = [0.0..99.0], chunk1 = [1000.0..1099.0]
+    std::vector<float> f32_c0(chunk_size), f32_c1(chunk_size);
+    std::vector<double> f64_c0(chunk_size), f64_c1(chunk_size);
+    for (int i = 0; i < chunk_size; i++) {
+        f32_c0[i] = static_cast<float>(i);
+        f32_c1[i] = 1000.0f + i;
+        f64_c0[i] = static_cast<double>(i);
+        f64_c1[i] = 1000.0 + i;
+    }
+
+    // String: chunk0 = "a0".."a99", chunk1 = "b0".."b99"
+    std::vector<std::string> str_c0(chunk_size), str_c1(chunk_size);
+    for (int i = 0; i < chunk_size; i++) {
+        str_c0[i] = "a" + std::to_string(i);
+        str_c1[i] = "b" + std::to_string(i);
+    }
+
+    // PK, row_ids, timestamps
+    std::vector<int64_t> pk_c0(chunk_size), pk_c1(chunk_size);
+    std::vector<int64_t> rowid_c0(chunk_size), rowid_c1(chunk_size);
+    std::vector<int64_t> ts_c0(chunk_size, 1), ts_c1(chunk_size, 1);
+    for (int i = 0; i < chunk_size; i++) {
+        pk_c0[i] = i;
+        pk_c1[i] = chunk_size + i;
+        rowid_c0[i] = i;
+        rowid_c1[i] = chunk_size + i;
+    }
+
+    // Vector (required but not used in filter)
+    std::vector<float> vec_c0(chunk_size * dim, 0.0f);
+    std::vector<float> vec_c1(chunk_size * dim, 1.0f);
+
+    // ── Load all fields ──
+    LoadTwoChunkField(segment.get(),
+                      bool_fid.get(),
+                      MakeFieldData<bool>(DataType::BOOL, bool_c0),
+                      MakeFieldData<bool>(DataType::BOOL, bool_c1));
+    LoadTwoChunkField(segment.get(),
+                      int8_fid.get(),
+                      MakeFieldData<int8_t>(DataType::INT8, int8_c0),
+                      MakeFieldData<int8_t>(DataType::INT8, int8_c1));
+    LoadTwoChunkField(segment.get(),
+                      int16_fid.get(),
+                      MakeFieldData<int16_t>(DataType::INT16, i16_c0),
+                      MakeFieldData<int16_t>(DataType::INT16, i16_c1));
+    LoadTwoChunkField(segment.get(),
+                      int32_fid.get(),
+                      MakeFieldData<int32_t>(DataType::INT32, i32_c0),
+                      MakeFieldData<int32_t>(DataType::INT32, i32_c1));
+    LoadTwoChunkField(segment.get(),
+                      int64_fid.get(),
+                      MakeFieldData<int64_t>(DataType::INT64, i64_c0),
+                      MakeFieldData<int64_t>(DataType::INT64, i64_c1));
+    LoadTwoChunkField(segment.get(),
+                      float_fid.get(),
+                      MakeFieldData<float>(DataType::FLOAT, f32_c0),
+                      MakeFieldData<float>(DataType::FLOAT, f32_c1));
+    LoadTwoChunkField(segment.get(),
+                      double_fid.get(),
+                      MakeFieldData<double>(DataType::DOUBLE, f64_c0),
+                      MakeFieldData<double>(DataType::DOUBLE, f64_c1));
+    LoadTwoChunkField(segment.get(),
+                      string_fid.get(),
+                      MakeFieldData<std::string>(DataType::VARCHAR, str_c0),
+                      MakeFieldData<std::string>(DataType::VARCHAR, str_c1));
+    LoadTwoChunkField(segment.get(),
+                      pk_fid.get(),
+                      MakeFieldData<int64_t>(DataType::INT64, pk_c0),
+                      MakeFieldData<int64_t>(DataType::INT64, pk_c1));
+    LoadTwoChunkField(
+        segment.get(),
+        vec_fid.get(),
+        MakeFieldData<float>(DataType::VECTOR_FLOAT, vec_c0, dim),
+        MakeFieldData<float>(DataType::VECTOR_FLOAT, vec_c1, dim));
+    LoadTwoChunkField(segment.get(),
+                      RowFieldID.get(),
+                      MakeFieldData<int64_t>(DataType::INT64, rowid_c0),
+                      MakeFieldData<int64_t>(DataType::INT64, rowid_c1));
+    LoadTwoChunkField(segment.get(),
+                      TimestampFieldID.get(),
+                      MakeFieldData<int64_t>(DataType::INT64, ts_c0),
+                      MakeFieldData<int64_t>(DataType::INT64, ts_c1));
+
+    // ── Verify SkipIndex for all numeric types ──
+    auto& skip_index = segment->GetSkipIndex();
+
+    // Int8: chunk0 has [0..49], chunk1 has [50..99], IN={55,60}
+    EXPECT_TRUE(skip_index.CanSkipInQuery<int8_t>(
+        int8_fid, 0, std::vector<int8_t>{55, 60}));
+    EXPECT_FALSE(skip_index.CanSkipInQuery<int8_t>(
+        int8_fid, 1, std::vector<int8_t>{55, 60}));
+
+    // Int16: chunk0 has [0..99], chunk1 has [1000..1099], IN={1005,1050}
+    EXPECT_TRUE(skip_index.CanSkipInQuery<int16_t>(
+        int16_fid, 0, std::vector<int16_t>{1005, 1050}));
+    EXPECT_FALSE(skip_index.CanSkipInQuery<int16_t>(
+        int16_fid, 1, std::vector<int16_t>{1005, 1050}));
+
+    // Int32
+    EXPECT_TRUE(skip_index.CanSkipInQuery<int32_t>(
+        int32_fid, 0, std::vector<int32_t>{1005, 1050}));
+    EXPECT_FALSE(skip_index.CanSkipInQuery<int32_t>(
+        int32_fid, 1, std::vector<int32_t>{1005, 1050}));
+
+    // Int64
+    EXPECT_TRUE(skip_index.CanSkipInQuery<int64_t>(
+        int64_fid, 0, std::vector<int64_t>{1005, 1050}));
+    EXPECT_FALSE(skip_index.CanSkipInQuery<int64_t>(
+        int64_fid, 1, std::vector<int64_t>{1005, 1050}));
+
+    // Float
+    EXPECT_TRUE(skip_index.CanSkipInQuery<float>(
+        float_fid, 0, std::vector<float>{1005.0f, 1050.0f}));
+    EXPECT_FALSE(skip_index.CanSkipInQuery<float>(
+        float_fid, 1, std::vector<float>{1005.0f, 1050.0f}));
+
+    // Double
+    EXPECT_TRUE(skip_index.CanSkipInQuery<double>(
+        double_fid, 0, std::vector<double>{1005.0, 1050.0}));
+    EXPECT_FALSE(skip_index.CanSkipInQuery<double>(
+        double_fid, 1, std::vector<double>{1005.0, 1050.0}));
+
+    // String: chunk0 has "a0".."a99", chunk1 has "b0".."b99", IN={"b5","b50"}
+    // This verifies the string_view skip-index fix (GetElementValues<string_view>
+    // used to return empty, silently disabling skip for varchar sealed segments).
+    EXPECT_TRUE(skip_index.CanSkipInQuery<std::string>(
+        string_fid, 0, std::vector<std::string>{"b5", "b50"}));
+    EXPECT_FALSE(skip_index.CanSkipInQuery<std::string>(
+        string_fid, 1, std::vector<std::string>{"b5", "b50"}));
+
+    // ── Test each data type ──
+
+    // Bool: IN (true) → should match chunk1 only (100 rows)
+    EXPECT_EQ(
+        RunFilterAndCountMatches(
+            segment.get(), MakeTermExprBool(bool_fid, {true}), total_rows),
+        chunk_size);
+
+    // Bool: IN (false) → should match chunk0 only (100 rows)
+    EXPECT_EQ(
+        RunFilterAndCountMatches(
+            segment.get(), MakeTermExprBool(bool_fid, {false}), total_rows),
+        chunk_size);
+
+    // Int8: IN (55, 60) → only in chunk1 (chunk0 has 0..49)
+    EXPECT_EQ(RunFilterAndCountMatches(
+                  segment.get(),
+                  MakeTermExprInt64(int8_fid, DataType::INT8, {55, 60}),
+                  total_rows),
+              4);  // each value appears twice (100/50=2 repeats)
+
+    // Int16: IN (1005, 1050) → only in chunk1
+    EXPECT_EQ(RunFilterAndCountMatches(
+                  segment.get(),
+                  MakeTermExprInt64(int16_fid, DataType::INT16, {1005, 1050}),
+                  total_rows),
+              2);
+
+    // Int32: IN (1005, 1050) → only in chunk1
+    EXPECT_EQ(RunFilterAndCountMatches(
+                  segment.get(),
+                  MakeTermExprInt64(int32_fid, DataType::INT32, {1005, 1050}),
+                  total_rows),
+              2);
+
+    // Int64: IN (1005, 1050) → only in chunk1
+    EXPECT_EQ(RunFilterAndCountMatches(
+                  segment.get(),
+                  MakeTermExprInt64(int64_fid, DataType::INT64, {1005, 1050}),
+                  total_rows),
+              2);
+
+    // Float: IN (1005.0, 1050.0) → only in chunk1
+    EXPECT_EQ(
+        RunFilterAndCountMatches(
+            segment.get(),
+            MakeTermExprFloat(float_fid, DataType::FLOAT, {1005.0, 1050.0}),
+            total_rows),
+        2);
+
+    // Double: IN (1005.0, 1050.0) → only in chunk1
+    EXPECT_EQ(
+        RunFilterAndCountMatches(
+            segment.get(),
+            MakeTermExprFloat(double_fid, DataType::DOUBLE, {1005.0, 1050.0}),
+            total_rows),
+        2);
+
+    // String: IN ("b5", "b50") → only in chunk1
+    EXPECT_EQ(
+        RunFilterAndCountMatches(segment.get(),
+                                 MakeTermExprString(string_fid, {"b5", "b50"}),
+                                 total_rows),
+        2);
+
+    // Cross-chunk: IN values spanning both chunks → should find in both
+    // Int32: IN (5, 1005) → one in each chunk
+    EXPECT_EQ(RunFilterAndCountMatches(
+                  segment.get(),
+                  MakeTermExprInt64(int32_fid, DataType::INT32, {5, 1005}),
+                  total_rows),
+              2);
+
+    // Empty result: IN values not in any chunk
+    EXPECT_EQ(RunFilterAndCountMatches(
+                  segment.get(),
+                  MakeTermExprInt64(int32_fid, DataType::INT32, {9999, 8888}),
+                  total_rows),
+              0);
+}

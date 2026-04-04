@@ -6,15 +6,13 @@ import (
 
 func (v *visitor) combineOrEqualsToIn(parts []*planpb.Expr) []*planpb.Expr {
 	type group struct {
-		col         *planpb.ColumnInfo
-		values      []*planpb.GenericValue
-		origIndices []int
-		valCase     string
+		col     *planpb.ColumnInfo
+		values  []*planpb.GenericValue
+		valCase string
 	}
 	others := make([]*planpb.Expr, 0, len(parts))
 	groups := make(map[string]*group)
-	indexToExpr := parts
-	for idx, e := range parts {
+	for _, e := range parts {
 		u := e.GetUnaryRangeExpr()
 		if u == nil || u.GetOp() != planpb.OpType_Equal || u.GetValue() == nil {
 			others = append(others, e)
@@ -29,7 +27,7 @@ func (v *visitor) combineOrEqualsToIn(parts []*planpb.Expr) []*planpb.Expr {
 		g, ok := groups[key]
 		valCase := valueCase(u.GetValue())
 		if !ok {
-			g = &group{col: col, values: []*planpb.GenericValue{}, origIndices: []int{}, valCase: valCase}
+			g = &group{col: col, values: []*planpb.GenericValue{}, valCase: valCase}
 			groups[key] = g
 		}
 		if g.valCase != valCase {
@@ -37,18 +35,15 @@ func (v *visitor) combineOrEqualsToIn(parts []*planpb.Expr) []*planpb.Expr {
 			continue
 		}
 		g.values = append(g.values, u.GetValue())
-		g.origIndices = append(g.origIndices, idx)
 	}
 	out := make([]*planpb.Expr, 0, len(parts))
 	out = append(out, others...)
 	for _, g := range groups {
-		if shouldUseInExprWithPK(g.col.GetDataType(), len(g.values), g.col.GetIsPrimaryKey()) {
-			g.values = sortGenericValues(g.values)
-			out = append(out, newTermExpr(g.col, g.values))
+		g.values = sortGenericValues(g.values)
+		if len(g.values) == 1 {
+			out = append(out, newUnaryRangeExpr(g.col, planpb.OpType_Equal, g.values[0]))
 		} else {
-			for _, i := range g.origIndices {
-				out = append(out, indexToExpr[i])
-			}
+			out = append(out, newTermExpr(g.col, g.values))
 		}
 	}
 	return out
@@ -56,15 +51,13 @@ func (v *visitor) combineOrEqualsToIn(parts []*planpb.Expr) []*planpb.Expr {
 
 func (v *visitor) combineAndNotEqualsToNotIn(parts []*planpb.Expr) []*planpb.Expr {
 	type group struct {
-		col         *planpb.ColumnInfo
-		values      []*planpb.GenericValue
-		origIndices []int
-		valCase     string
+		col     *planpb.ColumnInfo
+		values  []*planpb.GenericValue
+		valCase string
 	}
 	others := make([]*planpb.Expr, 0, len(parts))
 	groups := make(map[string]*group)
-	indexToExpr := parts
-	for idx, e := range parts {
+	for _, e := range parts {
 		u := e.GetUnaryRangeExpr()
 		if u == nil || u.GetOp() != planpb.OpType_NotEqual || u.GetValue() == nil {
 			others = append(others, e)
@@ -79,7 +72,7 @@ func (v *visitor) combineAndNotEqualsToNotIn(parts []*planpb.Expr) []*planpb.Exp
 		g, ok := groups[key]
 		valCase := valueCase(u.GetValue())
 		if !ok {
-			g = &group{col: col, values: []*planpb.GenericValue{}, origIndices: []int{}, valCase: valCase}
+			g = &group{col: col, values: []*planpb.GenericValue{}, valCase: valCase}
 			groups[key] = g
 		}
 		if g.valCase != valCase {
@@ -87,106 +80,15 @@ func (v *visitor) combineAndNotEqualsToNotIn(parts []*planpb.Expr) []*planpb.Exp
 			continue
 		}
 		g.values = append(g.values, u.GetValue())
-		g.origIndices = append(g.origIndices, idx)
 	}
 	out := make([]*planpb.Expr, 0, len(parts))
 	out = append(out, others...)
 	for _, g := range groups {
-		if shouldUseInExprWithPK(g.col.GetDataType(), len(g.values), g.col.GetIsPrimaryKey()) {
-			g.values = sortGenericValues(g.values)
-			in := newTermExpr(g.col, g.values)
-			out = append(out, notExpr(in))
-		} else {
-			for _, i := range g.origIndices {
-				out = append(out, indexToExpr[i])
-			}
-		}
+		g.values = sortGenericValues(g.values)
+		in := newTermExpr(g.col, g.values)
+		out = append(out, notExpr(in))
 	}
 	return out
-}
-
-// splitTermToOrEquals converts TermExpr(in [v1, v2, ...]) to
-// v == v1 OR v == v2 OR ... (left-associative binary OR tree).
-func splitTermToOrEquals(expr *planpb.TermExpr) *planpb.Expr {
-	col := expr.GetColumnInfo()
-	values := expr.GetValues()
-
-	if len(values) == 0 {
-		return &planpb.Expr{Expr: &planpb.Expr_TermExpr{TermExpr: expr}}
-	}
-
-	equals := make([]*planpb.Expr, len(values))
-	for i, val := range values {
-		equals[i] = &planpb.Expr{
-			Expr: &planpb.Expr_UnaryRangeExpr{
-				UnaryRangeExpr: &planpb.UnaryRangeExpr{
-					ColumnInfo: col,
-					Op:         planpb.OpType_Equal,
-					Value:      val,
-				},
-			},
-		}
-	}
-
-	if len(equals) == 1 {
-		return equals[0]
-	}
-
-	result := equals[0]
-	for i := 1; i < len(equals); i++ {
-		result = &planpb.Expr{
-			Expr: &planpb.Expr_BinaryExpr{
-				BinaryExpr: &planpb.BinaryExpr{
-					Left:  result,
-					Right: equals[i],
-					Op:    planpb.BinaryExpr_LogicalOr,
-				},
-			},
-		}
-	}
-	return result
-}
-
-// splitTermToAndNotEquals converts NOT(in [v1, v2, ...]) to
-// v != v1 AND v != v2 AND ... (left-associative binary AND tree).
-func splitTermToAndNotEquals(expr *planpb.TermExpr) *planpb.Expr {
-	col := expr.GetColumnInfo()
-	values := expr.GetValues()
-
-	if len(values) == 0 {
-		return notExpr(&planpb.Expr{Expr: &planpb.Expr_TermExpr{TermExpr: expr}})
-	}
-
-	notEquals := make([]*planpb.Expr, len(values))
-	for i, val := range values {
-		notEquals[i] = &planpb.Expr{
-			Expr: &planpb.Expr_UnaryRangeExpr{
-				UnaryRangeExpr: &planpb.UnaryRangeExpr{
-					ColumnInfo: col,
-					Op:         planpb.OpType_NotEqual,
-					Value:      val,
-				},
-			},
-		}
-	}
-
-	if len(notEquals) == 1 {
-		return notEquals[0]
-	}
-
-	result := notEquals[0]
-	for i := 1; i < len(notEquals); i++ {
-		result = &planpb.Expr{
-			Expr: &planpb.Expr_BinaryExpr{
-				BinaryExpr: &planpb.BinaryExpr{
-					Left:  result,
-					Right: notEquals[i],
-					Op:    planpb.BinaryExpr_LogicalAnd,
-				},
-			},
-		}
-	}
-	return result
 }
 
 func notExpr(child *planpb.Expr) *planpb.Expr {
@@ -351,15 +253,19 @@ func (v *visitor) combineOrInWithEqual(parts []*planpb.Expr) []*planpb.Expr {
 		if g.term == nil || len(g.eqIdxs) == 0 {
 			continue
 		}
-		// union all equal values into term set
-		union := g.term.GetValues()
+		// union all equal values into term set; copy to avoid aliasing proto's backing array
+		union := append([]*planpb.GenericValue(nil), g.term.GetValues()...)
 		for i, ev := range g.eqVals {
 			union = append(union, ev)
 			used[g.eqIdxs[i]] = true
 		}
 		union = sortGenericValues(union)
 		used[g.termIdx] = true
-		out = append(out, newTermExpr(g.col, union))
+		if len(union) == 1 {
+			out = append(out, newUnaryRangeExpr(g.col, planpb.OpType_Equal, union[0]))
+		} else {
+			out = append(out, newTermExpr(g.col, union))
+		}
 	}
 	for i := range parts {
 		if !used[i] {
@@ -512,7 +418,11 @@ func (v *visitor) combineOrInWithIn(parts []*planpb.Expr) []*planpb.Expr {
 		for _, i := range g.idxs {
 			used[i] = true
 		}
-		out = append(out, newTermExpr(g.col, union))
+		if len(union) == 1 {
+			out = append(out, newUnaryRangeExpr(g.col, planpb.OpType_Equal, union[0]))
+		} else {
+			out = append(out, newTermExpr(g.col, union))
+		}
 	}
 	for i := range parts {
 		if !used[i] {
@@ -582,6 +492,8 @@ func (v *visitor) combineAndInWithIn(parts []*planpb.Expr) []*planpb.Expr {
 		}
 		if len(inter) == 0 {
 			out = append(out, newAlwaysFalseExpr())
+		} else if len(inter) == 1 {
+			out = append(out, newUnaryRangeExpr(g.col, planpb.OpType_Equal, inter[0]))
 		} else {
 			out = append(out, newTermExpr(g.col, inter))
 		}

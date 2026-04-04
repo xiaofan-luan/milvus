@@ -24,10 +24,10 @@ The rewriter can be configured via the following parameter (refreshable at runti
 1) IN / NOT IN normalization and merges (`term_in.go`)
 - OR-equals to IN (same column):
   - `a == v1 OR a == v2 ...` → `a IN (v1, v2, ...)`
-  - Numeric columns only merge when count > threshold (default 150); others when count > 1.
+  - Numeric columns only merge when count >= threshold (int: 10, float: 15); others when count >= 3.
 - AND-not-equals to NOT IN (same column):
   - `a != v1 AND a != v2 ...` → `NOT (a IN (v1, v2, ...))`
-  - Same thresholds as above.
+  - Same thresholds as above (int: 10, float: 15, others: 3).
 - IN vs Equal redundancy elimination (same column):
   - AND: `(a ∈ S) AND (a = v)`:
     - if `v ∈ S` → `a = v`
@@ -91,7 +91,7 @@ The rewriter can be configured via the following parameter (refreshable at runti
 - All merges require operands to target the same column (same `ColumnInfo`, including nested path/element type).
 - Rewrite runs after template value filling; template placeholders do not appear here.
 - Sorting/dedup for IN/NOT IN is deterministic; duplicates are removed post-sort.
-- Numeric-threshold for OR→IN / AND≠→NOT IN is defined in `util.go` (`defaultConvertOrToInNumericLimit`, default 150).
+- Thresholds for OR→IN / AND≠→NOT IN are defined in `util.go` (int: 10, float: 15, others: 3).
 
 ### Pass Ordering (current)
 - OR branch:
