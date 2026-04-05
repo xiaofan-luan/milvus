@@ -440,6 +440,7 @@ class SetElement<bool> : public MultiElement {
 //   In()          — per-row fallback (linear scan, no hash overhead)
 //   FilterChunk() — batch SIMD via simdFilterChunk() (preferred)
 // ═══════════════════════════════════════════════════════════════════════════
+
 template <typename T>
 class SimdBatchElement : public MultiElement {
     static_assert(std::is_same_v<T, int8_t> || std::is_same_v<T, uint8_t> ||

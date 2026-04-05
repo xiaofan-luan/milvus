@@ -1026,33 +1026,25 @@ PhyTermFilterExpr::ExecVisitorImplForData(EvalCtx& context) {
             // All numeric types: SIMD for small IN, hash for large IN.
             // Crossover benchmarked with ankerl hash at load_factor=0.5.
             // Automatically adapts to all architectures:
-            //   AVX512 int32 (kLanes=16): threshold=64
-            //   AVX2   int32 (kLanes=8):  threshold=32
-            //   AVX2   int64 (kLanes=4):  threshold=16
-            //   NEON   int32 (kLanes=4):  threshold=16
-            //   NEON   int64 (kLanes=2):  threshold=8
+            //   AVX512 int32 (kLanes=16): threshold=128
+            //   AVX2   int32 (kLanes=8):  threshold=64
+            //   AVX2   int64 (kLanes=4):  threshold=32
+            //   NEON   int32 (kLanes=4):  threshold=32
+            //   NEON   int64 (kLanes=2):  threshold=16
             const size_t kSimdThreshold =
-                static_cast<size_t>(simdLaneCount<T>()) * 4;
+                static_cast<size_t>(simdLaneCount<T>()) * 8;
             if (vals.size() <= kSimdThreshold) {
-                arg_set_ = std::make_shared<SimdBatchElement<T>>(vals);
-            } else {
-                arg_set_ = std::make_shared<SetElement<T>>(vals);
-            }
-        }
-        // Cache SIMD FilterChunk dispatch (numeric types only).
-        // SIMD path runs batch filter first, then applies validity/bitmap
-        // masks — avoids per-row variant construction entirely.
-        if constexpr (!std::is_same_v<T, bool> &&
-                      !std::is_same_v<T, std::string> &&
-                      !std::is_same_v<T, std::string_view>) {
-            if (auto simd_elem =
-                    std::dynamic_pointer_cast<SimdBatchElement<T>>(arg_set_)) {
+                auto simd_elem = std::make_shared<SimdBatchElement<T>>(vals);
+                arg_set_ = simd_elem;
+                // Cache SIMD FilterChunk directly — no dynamic_pointer_cast needed.
                 cached_filter_chunk_ = [simd_elem](const void* data,
                                                    int size,
                                                    TargetBitmapView res) {
                     simd_elem->FilterChunk(
                         static_cast<const T*>(data), size, res);
                 };
+            } else {
+                arg_set_ = std::make_shared<SetElement<T>>(vals);
             }
         }
         // Cache string SetElement pointer for per-row direct lookup.
