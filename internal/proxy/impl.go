@@ -3753,6 +3753,7 @@ func (node *Proxy) query(ctx context.Context, qt *queryTask, sp trace.Span) (*mi
 		if span >= paramtable.Get().ProxyCfg.SlowQuerySpanInSeconds.GetAsDuration(time.Second) {
 			log.Info(
 				rpcSlow(method),
+				zap.String("queryLabel", queryLabel),
 				zap.String("expr", request.Expr),
 				zap.Strings("OutputFields", request.OutputFields),
 				zap.Uint64("travel_timestamp", request.TravelTimestamp),
