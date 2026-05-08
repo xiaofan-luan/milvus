@@ -44,7 +44,7 @@ class JsonFlatIndexQueryExecutor : public InvertedIndexTantivy<T> {
     }
 
     TargetBitmap
-    Exists() {
+    Exists() override {
         tracer::AutoSpan span("JsonFlatIndexQueryExecutor::Exists",
                               tracer::GetRootSpan());
         TargetBitmap bitset(this->Count());
