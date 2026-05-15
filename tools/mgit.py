@@ -1130,7 +1130,7 @@ Keep the response concise and actionable. Focus on the most important conflicts 
         Validate that design doc matches the code changes using AI
 
         Args:
-            design_doc_url: URL to the design doc (GitHub blob URL)
+            design_doc_url: Path or URL to the design doc
             diff: Code diff
             files: List of changed files
             stats: Diff statistics
@@ -1234,12 +1234,20 @@ Keep concerns and suggestions concise and actionable.
                 "suggestions": ["Check API keys or network connectivity"],
             }
 
-    def _fetch_design_doc(self, url: str) -> str:
-        """Fetch design doc content from GitHub URL"""
-        # Convert blob URL to raw URL
-        # https://github.com/milvus-io/milvus-design-docs/blob/main/design_docs/xxx.md
-        # -> https://raw.githubusercontent.com/milvus-io/milvus-design-docs/main/design_docs/xxx.md
-        raw_url = url.replace("github.com", "raw.githubusercontent.com").replace(
+    def _fetch_design_doc(self, design_doc_ref: str) -> str:
+        """Fetch design doc content from a local path or GitHub URL"""
+        if not design_doc_ref.startswith(("http://", "https://")):
+            repo_root = GitOperations.run_command(["git", "rev-parse", "--show-toplevel"])
+            path = design_doc_ref
+            if not os.path.isabs(path):
+                path = os.path.join(repo_root, path)
+            path = os.path.normpath(path)
+            if not os.path.isfile(path):
+                raise Exception(f"Local design doc not found: {design_doc_ref}")
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
+
+        raw_url = design_doc_ref.replace("github.com", "raw.githubusercontent.com").replace(
             "/blob/", "/"
         )
 
@@ -2821,9 +2829,9 @@ def workflow_pr():
     if issue_type == "feature":
         print_header("\n📄 Design Document")
         print_warning(
-            "Feature PRs require a design document in milvus-io/milvus-design-docs"
+            "Feature PRs require a design document under docs/design-docs/design_docs/"
         )
-        print_info("Design doc repo: https://github.com/milvus-io/milvus-design-docs")
+        print_info("The design document can be included in the same PR as the implementation.")
 
         # Get diff for validation
         upstream_master = GitOperations.get_upstream_master()
@@ -2837,7 +2845,7 @@ def workflow_pr():
 
         while True:
             design_doc_url = UserInteraction.prompt(
-                "Design doc URL (enter 'skip' to skip, or 'cancel' to abort):"
+                "Design doc path or URL (enter 'skip' to skip, or 'cancel' to abort):"
             )
 
             # Allow skipping or canceling
@@ -2849,14 +2857,15 @@ def workflow_pr():
                 print_warning("Skipping design doc validation")
                 break
 
-            # Validate design doc URL
+            # Validate design doc path or URL
             if not design_doc_url:
-                print_error("Design doc URL is required for feature PRs (enter 'skip' to skip)")
+                print_error("Design doc path or URL is required for feature PRs (enter 'skip' to skip)")
                 continue
 
-            if "milvus-io/milvus-design-docs" not in design_doc_url:
+            normalized_design_doc_ref = design_doc_url.replace("\\", "/")
+            if "docs/design-docs/design_docs/" not in normalized_design_doc_ref:
                 print_error(
-                    "Design doc must be in milvus-io/milvus-design-docs repository"
+                    "Design doc must be under docs/design-docs/design_docs/"
                 )
                 if not UserInteraction.confirm("Continue anyway?"):
                     continue
