@@ -1,0 +1,14 @@
+filters:
+  ".*":
+    reviewers:
+      - czs007
+      - jeffoverflow
+      - scsven
+      - shengjun1985
+      - sunby
+      - xiaofan-luan
+      - xige-16
+      - yanliang567
+      - zwd1208
+    approvers:
+      - maintainers
