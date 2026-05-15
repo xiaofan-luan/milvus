@@ -532,7 +532,7 @@ pull_request_rules:
           - label=kind/feature
       - -title~=\[automated\]
       # PR body does not reference an in-repo design doc, and the PR does not add one
-      - -body~=docs/design-docs/design_docs/[^\s]+\.md
+      - '-body~=(^|\s)docs/design-docs/design_docs/[^\s]+\.md'
       - -files~=^docs/design-docs/design_docs/.*\.md$
     actions:
       label:
@@ -553,7 +553,7 @@ pull_request_rules:
       - or: *BRANCHES
       - label=do-not-merge/missing-design-doc
       - or:
-          - body~=docs/design-docs/design_docs/[^\s]+\.md
+          - 'body~=(^|\s)docs/design-docs/design_docs/[^\s]+\.md'
           - files~=^docs/design-docs/design_docs/.*\.md$
     actions:
       label:

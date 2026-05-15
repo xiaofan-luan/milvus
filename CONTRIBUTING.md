@@ -101,9 +101,20 @@ git checkout upstream/master -b my-topic-branch
 
 ### Design documents
 
-Milvus feature work and major enhancements should include a design document. The design document can be submitted in the same pull request as the related implementation, or in an earlier pull request when the design needs review before code changes. Feature pull requests should link the related design document in the pull request description.
+Milvus feature pull requests must provide a design document. This applies when the pull request title starts with `feat:` or the pull request is labeled `kind/feature`. Large enhancements that introduce new architecture, storage formats, public behavior, or upgrade impact should also include a design document; reviewers may add `kind/feature` when the design-doc requirement applies.
 
-Design documents live under `docs/design-docs/design_docs/`. Name each file `YYYYMMDD-short-descriptive-name.md`, keep one design per file, and put images or diagrams under `docs/design-docs/assets/graphs/` or `docs/design-docs/assets/images/`.
+To satisfy the requirement, do one of the following:
+
+- Add or update the design document in the same pull request as the related implementation.
+- Link an existing in-repo design document in the pull request description.
+
+Use this pull request description format when linking an existing document:
+
+```markdown
+design doc: docs/design-docs/design_docs/YYYYMMDD-short-descriptive-name.md
+```
+
+Design documents must live under `docs/design-docs/design_docs/`. Name each file `YYYYMMDD-short-descriptive-name.md`, keep one design per file, and put images or diagrams under `docs/design-docs/assets/graphs/` or `docs/design-docs/assets/images/`. External design-doc repository links do not satisfy this requirement. Mergify adds the `do-not-merge/missing-design-doc` label to feature PRs until this requirement is met.
 
 Start each design document with a clear title and metadata block:
 

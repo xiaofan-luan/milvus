@@ -87,6 +87,11 @@ def print_header(msg: str):
     print(f"\n{Colors.BOLD}{msg}{Colors.RESET}")
 
 
+def is_valid_design_doc_ref(design_doc_ref: str) -> bool:
+    normalized_ref = design_doc_ref.replace("\\", "/")
+    return re.fullmatch(r"docs/design-docs/design_docs/\S+\.md", normalized_ref) is not None
+
+
 # ============================================================================
 # Git Module - Git operations
 # ============================================================================
@@ -2832,6 +2837,7 @@ def workflow_pr():
             "Feature PRs require a design document under docs/design-docs/design_docs/"
         )
         print_info("The design document can be included in the same PR as the implementation.")
+        print_info("Example: docs/design-docs/design_docs/YYYYMMDD-short-descriptive-name.md")
 
         # Get diff for validation
         upstream_master = GitOperations.get_upstream_master()
@@ -2845,30 +2851,22 @@ def workflow_pr():
 
         while True:
             design_doc_url = UserInteraction.prompt(
-                "Design doc path or URL (enter 'skip' to skip, or 'cancel' to abort):"
+                "Design doc path (enter 'cancel' to abort):"
             )
 
-            # Allow skipping or canceling
             if design_doc_url.lower() == "cancel":
                 print_error("PR creation cancelled")
                 sys.exit(1)
 
-            if design_doc_url.lower() == "skip":
-                print_warning("Skipping design doc validation")
-                break
-
-            # Validate design doc path or URL
             if not design_doc_url:
-                print_error("Design doc path or URL is required for feature PRs (enter 'skip' to skip)")
+                print_error("Design doc path is required for feature PRs")
                 continue
 
-            normalized_design_doc_ref = design_doc_url.replace("\\", "/")
-            if "docs/design-docs/design_docs/" not in normalized_design_doc_ref:
+            if not is_valid_design_doc_ref(design_doc_url):
                 print_error(
-                    "Design doc must be under docs/design-docs/design_docs/"
+                    "Design doc must be a markdown file under docs/design-docs/design_docs/"
                 )
-                if not UserInteraction.confirm("Continue anyway?"):
-                    continue
+                continue
 
             # Validate design doc matches code changes using AI
             if ai_service.has_api_key:
