@@ -62,6 +62,14 @@ type FunctionRunnerManager interface {
 	// are closed only after all keys are released.
 	Release(collectionID int64, key string)
 
+	// EnsureReady synchronously initializes every runner of the schema's
+	// version and returns the first initialization error. Complements
+	// Alloc/Update (whose initialization is asynchronous and best-effort):
+	// callers that need runner readiness as a hard precondition — e.g. the
+	// delegator before publishing a ready schema snapshot — call this after
+	// Alloc/Update. A schema without runner-backed functions is trivially ready.
+	EnsureReady(ctx context.Context, collectionID int64, schema *schemapb.CollectionSchema) error
+
 	// Materialize fills missing function output fields for an insert request.
 	// Passing a nil schema uses the latest version snapshot already allocated by
 	// Create, recovery, or update; any foreground runner initialization uses the
@@ -528,6 +536,27 @@ func (m *functionRunnerManager) Update(
 	return m.getOrCreateEntry(collectionID).Update(key, schema)
 }
 
+// EnsureReady synchronously initializes the runners of schema's version, see
+// functionRunnerCollectionEntry.EnsureReady. A schema without embedding
+// functions is trivially ready.
+func (m *functionRunnerManager) EnsureReady(
+	ctx context.Context,
+	collectionID int64,
+	schema *schemapb.CollectionSchema,
+) error {
+	if schema == nil {
+		return merr.WrapErrFunctionFailedMsg("collection schema is nil")
+	}
+	if !HasEmbeddingFunctions(schema) {
+		return nil
+	}
+	entry := m.getEntry(collectionID)
+	if entry == nil {
+		return merr.WrapErrFunctionFailedMsg("function runners for collection %d are not allocated", collectionID)
+	}
+	return entry.EnsureReady(ctx, schema.GetVersion())
+}
+
 func (e *functionRunnerCollectionEntry) ensureVersion(
 	key string,
 	schema *schemapb.CollectionSchema,
@@ -670,6 +699,37 @@ func (e *functionRunnerCollectionEntry) updateKeyVersionLocked(
 	if version <= schemaVersion {
 		e.keyVersions[key] = schemaVersion
 	}
+}
+
+// EnsureReady synchronously initializes every runner of the given schema
+// version and returns the first initialization error. Unlike allocOrUpdate's
+// background warm-up goroutine, this gives callers (the delegator ready-schema
+// publish gate) a hard guarantee: when it returns nil, every runner of the
+// version serves requests without lazy read-path initialization.
+func (e *functionRunnerCollectionEntry) EnsureReady(ctx context.Context, schemaVersion int32) error {
+	e.mu.RLock()
+	versionRunners, ok := e.getVersionRunnerLocked(schemaVersion)
+	if !ok {
+		e.mu.RUnlock()
+		return merr.WrapErrFunctionFailedMsg("function runners for schema version %d are not allocated", schemaVersion)
+	}
+	runnerEntries := make([]*functionRunnerEntry, 0, len(versionRunners.signatures))
+	for _, signature := range versionRunners.signatures {
+		runnerEntry := e.runners[signature]
+		if runnerEntry == nil {
+			e.mu.RUnlock()
+			return merr.WrapErrFunctionFailedMsg("function runner %s for schema version %d is not allocated", signature, schemaVersion)
+		}
+		runnerEntries = append(runnerEntries, runnerEntry)
+	}
+	e.mu.RUnlock()
+
+	for _, runnerEntry := range runnerEntries {
+		if err := runnerEntry.ensureReady(ctx); err != nil {
+			return merr.Wrapf(err, "failed to initialize function runner %s for schema version %d", runnerEntry.signature, schemaVersion)
+		}
+	}
+	return nil
 }
 
 func (e *functionRunnerCollectionEntry) getRunnerEntryByOutputField(schemaVersion int32, outputFieldID int64) (*functionRunnerEntry, schemapb.FunctionType, bool) {
@@ -1220,6 +1280,14 @@ func UpdateFunctionRunners(
 
 func ReleaseFunctionRunners(collectionID int64, key string) {
 	defaultFunctionRunnerManager.Release(collectionID, key)
+}
+
+// EnsureRunnersReady synchronously initializes every function runner of the
+// schema's version, returning the first initialization error. Callers use it
+// to make runner readiness a precondition (e.g. before publishing a ready
+// schema snapshot) instead of relying on lazy read-path initialization.
+func EnsureRunnersReady(ctx context.Context, collectionID int64, schema *schemapb.CollectionSchema) error {
+	return defaultFunctionRunnerManager.EnsureReady(ctx, collectionID, schema)
 }
 
 func RunWithRunner(

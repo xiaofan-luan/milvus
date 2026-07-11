@@ -1418,8 +1418,14 @@ func validateDropFunction(schema *schemapb.CollectionSchema, functionName string
 	}
 
 	if !dropOutputFields {
-		if targetFunc.GetType() == schemapb.FunctionType_BM25 {
-			return merr.WrapErrParameterInvalidMsg("BM25 function must be dropped with its output field in drop_function_field interface: %s", functionName)
+		switch targetFunc.GetType() {
+		case schemapb.FunctionType_BM25, schemapb.FunctionType_MinHash:
+			// Search-time runner functions cannot be detached from their output
+			// fields: re-attaching a different function would silently mix
+			// corpora (query-time hashing/scoring vs indexed data). Mirrors the
+			// rootcoord rejection in buildSchemaForDetachFunction.
+			return merr.WrapErrParameterInvalidMsg(
+				"function %s must be dropped together with its output fields (set drop_function_output_fields=true)", functionName)
 		}
 		return nil
 	}

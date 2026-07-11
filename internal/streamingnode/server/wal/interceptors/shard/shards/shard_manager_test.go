@@ -835,6 +835,98 @@ func TestCollectionInfoSchemaVersion(t *testing.T) {
 	assert.Equal(t, int32(3), ci.SchemaVersion())
 }
 
+func TestIsAdditiveSchemaChange(t *testing.T) {
+	base := func() *schemapb.CollectionSchema {
+		return &schemapb.CollectionSchema{
+			EnableDynamicField: true,
+			Fields: []*schemapb.FieldSchema{
+				{FieldID: 100, DataType: schemapb.DataType_Int64, IsPrimaryKey: true},
+				{FieldID: 101, DataType: schemapb.DataType_FloatVector},
+				{FieldID: 102, DataType: schemapb.DataType_VarChar},
+			},
+			Functions: []*schemapb.FunctionSchema{
+				{Id: 1, Type: schemapb.FunctionType_BM25, OutputFieldIds: []int64{103}},
+			},
+		}
+	}
+
+	// nil old schema → destructive (fail-safe).
+	assert.False(t, isAdditiveSchemaChange(nil, base()))
+	// no-op → additive (trivially).
+	assert.True(t, isAdditiveSchemaChange(base(), base()))
+
+	// add a nullable field → additive.
+	add := base()
+	add.Fields = append(add.Fields, &schemapb.FieldSchema{FieldID: 104, DataType: schemapb.DataType_Double, Nullable: true})
+	assert.True(t, isAdditiveSchemaChange(base(), add))
+
+	// add a function (new output field) → additive.
+	addFn := base()
+	addFn.Fields = append(addFn.Fields, &schemapb.FieldSchema{FieldID: 105, DataType: schemapb.DataType_SparseFloatVector, IsFunctionOutput: true})
+	addFn.Functions = append(addFn.Functions, &schemapb.FunctionSchema{Id: 2, Type: schemapb.FunctionType_BM25, OutputFieldIds: []int64{105}})
+	assert.True(t, isAdditiveSchemaChange(base(), addFn))
+
+	// drop a field → destructive.
+	drop := base()
+	drop.Fields = drop.Fields[:2]
+	assert.False(t, isAdditiveSchemaChange(base(), drop))
+
+	// change a live field's type in place → destructive.
+	retype := base()
+	retype.Fields[2] = &schemapb.FieldSchema{FieldID: 102, DataType: schemapb.DataType_Int64}
+	assert.False(t, isAdditiveSchemaChange(base(), retype))
+
+	// flip nullability in place → destructive.
+	nullable := base()
+	nullable.Fields[2] = &schemapb.FieldSchema{FieldID: 102, DataType: schemapb.DataType_VarChar, Nullable: true}
+	assert.False(t, isAdditiveSchemaChange(base(), nullable))
+
+	// disable the dynamic field → destructive.
+	disableDynamic := base()
+	disableDynamic.EnableDynamicField = false
+	assert.False(t, isAdditiveSchemaChange(base(), disableDynamic))
+
+	// remove a function → destructive.
+	dropFn := base()
+	dropFn.Functions = nil
+	assert.False(t, isAdditiveSchemaChange(base(), dropFn))
+
+	// re-point a kept function's output → destructive.
+	repointFn := base()
+	repointFn.Functions = []*schemapb.FunctionSchema{{Id: 1, Type: schemapb.FunctionType_BM25, OutputFieldIds: []int64{104}}}
+	assert.False(t, isAdditiveSchemaChange(base(), repointFn))
+
+	// change a kept function's input/params in place (same id, same output) →
+	// destructive: a one-version-behind insert would be materialized under the new
+	// function while sibling writes on lagging vchannels use the old one.
+	changeInputFn := base()
+	changeInputFn.Functions = []*schemapb.FunctionSchema{{Id: 1, Type: schemapb.FunctionType_BM25, InputFieldIds: []int64{102}, OutputFieldIds: []int64{103}}}
+	assert.False(t, isAdditiveSchemaChange(base(), changeInputFn))
+}
+
+func TestCollectionInfoAcceptsSchemaVersion(t *testing.T) {
+	ci := &CollectionInfo{
+		Schema: &streamingpb.CollectionSchemaOfVChannel{Schema: &schemapb.CollectionSchema{Version: 5}},
+	}
+	// no previous-additive info yet: only the exact current version is accepted.
+	assert.True(t, ci.acceptsSchemaVersion(5))
+	assert.False(t, ci.acceptsSchemaVersion(4))
+	assert.False(t, ci.acceptsSchemaVersion(6))
+
+	// last change was additive from v4 → v5: accept v5 and v4, reject v3 and v6.
+	ci.PrevSchemaVersion = 4
+	ci.LastChangeAdditive = true
+	assert.True(t, ci.acceptsSchemaVersion(5))
+	assert.True(t, ci.acceptsSchemaVersion(4))
+	assert.False(t, ci.acceptsSchemaVersion(3), "two versions behind is rejected")
+	assert.False(t, ci.acceptsSchemaVersion(6))
+
+	// last change was destructive: only the exact current version is accepted.
+	ci.LastChangeAdditive = false
+	assert.True(t, ci.acceptsSchemaVersion(5))
+	assert.False(t, ci.acceptsSchemaVersion(4), "destructive predecessor is rejected")
+}
+
 func TestCollectionInfoUseGrowingSourceFlush(t *testing.T) {
 	paramtable.Init()
 	paramtable.Get().Save(paramtable.Get().CommonCfg.UseLoonFFI.Key, "false")

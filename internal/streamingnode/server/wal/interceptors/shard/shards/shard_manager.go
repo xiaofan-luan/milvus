@@ -9,6 +9,7 @@ import (
 
 	"github.com/cockroachdb/errors"
 	"github.com/samber/lo"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/resource"
@@ -218,6 +219,16 @@ type CollectionInfo struct {
 	VChannel     string
 	PartitionIDs map[int64]struct{}
 	Schema       *streamingpb.CollectionSchemaOfVChannel
+	// PrevSchemaVersion / LastChangeAdditive describe the most recent
+	// AlterCollection: the schema version before it, and whether that change was
+	// additive (add-only). The write gate uses them to accept an insert exactly
+	// one additive step behind while a schema change propagates across vchannels
+	// — segcore backfills the newly-added nullable/default columns and function
+	// outputs are materialized on the write path, so an incomplete insert is safe.
+	// Reconstructed by WAL replay (AlterCollection re-runs on recovery); zero
+	// values disable the relaxation until the next AlterCollection, which is safe.
+	PrevSchemaVersion  int32
+	LastChangeAdditive bool
 }
 
 // SchemaVersion returns the current collection schema version for the write path.
@@ -231,6 +242,64 @@ func (c *CollectionInfo) SchemaVersion() int32 {
 		return 0
 	}
 	return s.GetVersion()
+}
+
+// acceptsSchemaVersion reports whether a write stamped with schemaVersion may be
+// accepted against the current schema: an exact match, or exactly one additive
+// step behind (the previous version, when the most recent change was additive).
+func (c *CollectionInfo) acceptsSchemaVersion(schemaVersion int32) bool {
+	if schemaVersion == c.SchemaVersion() {
+		return true
+	}
+	return c.LastChangeAdditive && schemaVersion == c.PrevSchemaVersion
+}
+
+// isAdditiveSchemaChange reports whether every insert valid under oldSchema stays
+// valid under newSchema — i.e. newSchema only ADDS fields/functions and keeps
+// every existing field id's type and nullability. Dropping a field, changing a
+// live field's type/nullability, disabling the dynamic field, or removing/
+// re-pointing a function is destructive. Fail-safe: anything not positively
+// additive (including a nil old schema) is destructive.
+func isAdditiveSchemaChange(oldSchema, newSchema *schemapb.CollectionSchema) bool {
+	if oldSchema == nil || newSchema == nil {
+		return false
+	}
+	if oldSchema.GetEnableDynamicField() && !newSchema.GetEnableDynamicField() {
+		return false // disabling the dynamic field drops the $meta field
+	}
+	newByID := make(map[int64]*schemapb.FieldSchema)
+	for _, f := range typeutil.GetAllFieldSchemas(newSchema) {
+		newByID[f.GetFieldID()] = f
+	}
+	for _, oldF := range typeutil.GetAllFieldSchemas(oldSchema) {
+		newF, ok := newByID[oldF.GetFieldID()]
+		if !ok {
+			return false // a field was dropped
+		}
+		if oldF.GetDataType() != newF.GetDataType() ||
+			oldF.GetElementType() != newF.GetElementType() ||
+			oldF.GetNullable() != newF.GetNullable() {
+			return false // a live field's type/nullability changed in place
+		}
+	}
+	newFuncByID := make(map[int64]*schemapb.FunctionSchema)
+	for _, fn := range newSchema.GetFunctions() {
+		newFuncByID[fn.GetId()] = fn
+	}
+	for _, oldFn := range oldSchema.GetFunctions() {
+		newFn, ok := newFuncByID[oldFn.GetId()]
+		if !ok {
+			return false // a function was removed
+		}
+		// Any in-place change to a kept function (input fields, output fields,
+		// params such as an embedding model/endpoint, or type) is destructive: a
+		// one-version-behind insert would have its output materialized under the
+		// NEW function while sibling writes on lagging vchannels use the old one.
+		if !proto.Equal(oldFn, newFn) {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *CollectionInfo) UseGrowingSourceFlush() bool {

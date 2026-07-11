@@ -2,7 +2,9 @@ package rootcoord
 
 import (
 	"context"
+	"fmt"
 	"strings"
+	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/samber/lo"
@@ -58,6 +60,22 @@ func (c *Core) broadcastAlterCollectionForAlterCollection(ctx context.Context, r
 
 	if funcutil.SliceContain(req.GetDeleteKeys(), common.EnableDynamicSchemaKey) {
 		return merr.WrapErrParameterInvalidMsg("cannot delete key %s, dynamic field schema could support set to true/false", common.EnableDynamicSchemaKey)
+	}
+
+	// System-maintained schema-integrity properties are immutable through the
+	// public property API. max_field_id is the field-ID high-water mark that
+	// prevents a dropped field's ID from being re-assigned (re-assignment would
+	// resurrect the dropped column's not-yet-compacted data under a new field).
+	// Overwriting or deleting it silently disables the guard.
+	for _, reserved := range []string{common.MaxFieldIDKey} {
+		for _, kv := range req.GetProperties() {
+			if kv.GetKey() == reserved {
+				return merr.WrapErrParameterInvalidMsg("cannot alter system-maintained property %s", reserved)
+			}
+		}
+		if funcutil.SliceContain(req.GetDeleteKeys(), reserved) {
+			return merr.WrapErrParameterInvalidMsg("cannot delete system-maintained property %s", reserved)
+		}
 	}
 
 	// Validate timezone
@@ -488,6 +506,20 @@ func (c *DDLCallback) alterCollectionV2AckCallback(ctx context.Context, result m
 		}
 	}
 
+	// A schema change (add/drop field or function; Updates.Schema carries the
+	// bumped version) must not become client-visible before every shard
+	// delegator can serve it: wait for querycoord-aggregated readiness BEFORE
+	// expiring proxy caches. Returning an error keeps the caches unexpired and
+	// lets the broadcast framework retry this (idempotent) callback with
+	// backoff until ready — the client's AddField/DropField call blocks until
+	// then (or its own deadline; the framework keeps compensating in the
+	// background afterwards). The delegator-side schema version gate remains
+	// the correctness backstop for schemas observed early via cache misses.
+	if newSchema := body.GetUpdates().GetSchema(); newSchema != nil {
+		if err := c.waitCollectionSchemaReady(ctx, header.CollectionId, newSchema.GetVersion()); err != nil {
+			return err
+		}
+	}
 	return c.ExpireCaches(ctx, header)
 }
 
@@ -537,6 +569,40 @@ func (c *DDLCallback) applyBoundFieldIndexesInline(ctx context.Context, result m
 		}
 	}
 	return nil
+}
+
+// waitCollectionSchemaReady polls querycoord until every shard delegator of the
+// collection reports a ready schema version >= schemaVersion. Bounded per
+// callback attempt; on timeout it returns an error so the broadcast framework's
+// unbounded callback retry keeps driving it.
+func (c *DDLCallback) waitCollectionSchemaReady(ctx context.Context, collectionID int64, schemaVersion int32) error {
+	const (
+		pollInterval = time.Second
+		maxWait      = time.Minute
+	)
+	start := time.Now()
+	for {
+		resp, err := c.mixCoord.CheckSchemaReady(ctx, &querypb.CheckSchemaReadyRequest{
+			CollectionID:  collectionID,
+			SchemaVersion: schemaVersion,
+		})
+		if err = merr.CheckRPCCall(resp, err); err != nil {
+			return merr.Wrap(err, "failed to check schema readiness")
+		}
+		if resp.GetReady() {
+			return nil
+		}
+		if time.Since(start) > maxWait {
+			return merr.WrapErrServiceInternal(fmt.Sprintf(
+				"schema version %d of collection %d is not ready on all shard delegators yet; the change is committed and caches stay unexpired until ready",
+				schemaVersion, collectionID))
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(pollInterval):
+		}
+	}
 }
 
 // cascadeDropFieldIndexesInline drops indexes on dropped fields by inlining the

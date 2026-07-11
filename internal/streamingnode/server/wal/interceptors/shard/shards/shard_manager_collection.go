@@ -180,6 +180,11 @@ func (m *shardManagerImpl) AlterCollection(msg message.MutableAlterCollectionMes
 			return nil, status.NewInvalidArgument("schema change message has nil schema body")
 		}
 		collectionInfo := m.collections[collectionID]
+		// Record the pre-alter version and classify the change, so the write gate
+		// can accept an insert exactly one additive step behind while this schema
+		// change propagates across vchannels (§ additive relaxation).
+		collectionInfo.PrevSchemaVersion = collectionInfo.SchemaVersion()
+		collectionInfo.LastChangeAdditive = isAdditiveSchemaChange(collectionInfo.Schema.GetSchema(), schema)
 		collectionInfo.Schema = &streamingpb.CollectionSchemaOfVChannel{
 			Schema:             schema,
 			CheckpointTimeTick: timetick,
@@ -188,6 +193,8 @@ func (m *shardManagerImpl) AlterCollection(msg message.MutableAlterCollectionMes
 		logger.Info(context.TODO(), "updated collection schema in shard manager",
 			mlog.Int64("collectionID", collectionID),
 			mlog.Int32("schemaVersion", schema.GetVersion()),
+			mlog.Int32("prevSchemaVersion", collectionInfo.PrevSchemaVersion),
+			mlog.Bool("lastChangeAdditive", collectionInfo.LastChangeAdditive),
 			mlog.Uint64("checkpointTimeTick", timetick))
 	}
 
@@ -222,7 +229,13 @@ func (m *shardManagerImpl) checkIfCollectionSchemaVersionMatch(header *message.I
 	}
 
 	collectionSchemaVersion := collectionInfo.SchemaVersion()
-	if collectionSchemaVersion != header.GetSchemaVersion() {
+	// Additive relaxation: accept an exact version match, or an insert exactly one
+	// additive step behind (compiled against the previous version while this
+	// schema change is still propagating across vchannels). segcore backfills the
+	// newly-added nullable/default columns; the returned current version drives
+	// function-output materialization. A ≥2-behind or destructive-predecessor
+	// insert is rejected → proxy recompiles.
+	if !collectionInfo.acceptsSchemaVersion(header.GetSchemaVersion()) {
 		m.Logger().Warn(context.TODO(), "collection schema version not match", mlog.Int64("collectionID", collectionID),
 			mlog.Int32("schemaVersion", header.GetSchemaVersion()),
 			mlog.Int32("collectionSchemaVersion", collectionSchemaVersion))
