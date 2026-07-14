@@ -69,13 +69,16 @@ func TestCachedProxyServiceProvider_DescribeCollection_IgnoresLegacyDoPhysicalBa
 	globalMetaCache = mockCache
 
 	provider := &CachedProxyServiceProvider{Proxy: &Proxy{}}
-	resp, err := provider.DescribeCollection(ctx, &milvuspb.DescribeCollectionRequest{
+	request := &milvuspb.DescribeCollectionRequest{
 		DbName:         dbName,
 		CollectionName: collectionName,
-	})
+	}
+	resp, err := provider.DescribeCollection(ctx, request)
 	assert.NoError(t, err)
 	assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	assert.False(t, resp.GetSchema().GetDoPhysicalBackfill())
+	assert.Equal(t, collectionName, request.GetCollectionName())
+	assert.Zero(t, request.GetCollectionID())
 }
 
 func TestCachedProxyServiceProvider_DescribeCollection_FillsDbFromCacheWhenQueriedByID(t *testing.T) {
@@ -103,7 +106,6 @@ func TestCachedProxyServiceProvider_DescribeCollection_FillsDbFromCacheWhenQueri
 	// rather than echo the empty request.DbName / leave DbId at 0.
 	mockCache := &MockCache{}
 	mockCache.EXPECT().GetCollectionName(mock.Anything, "", collectionID).Return(collectionName, nil)
-	mockCache.EXPECT().GetCollectionID(mock.Anything, "", collectionName).Return(collectionID, nil)
 	mockCache.EXPECT().GetCollectionInfo(mock.Anything, "", collectionName, collectionID).Return(&collectionInfo{
 		collID:    collectionID,
 		dbName:    dbName,
@@ -114,15 +116,18 @@ func TestCachedProxyServiceProvider_DescribeCollection_FillsDbFromCacheWhenQueri
 	globalMetaCache = mockCache
 
 	provider := &CachedProxyServiceProvider{Proxy: &Proxy{}}
-	resp, err := provider.DescribeCollection(ctx, &milvuspb.DescribeCollectionRequest{
+	request := &milvuspb.DescribeCollectionRequest{
 		CollectionID: collectionID,
-	})
+	}
+	resp, err := provider.DescribeCollection(ctx, request)
 	assert.NoError(t, err)
 	assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	assert.Equal(t, collectionName, resp.GetCollectionName())
 	assert.Equal(t, collectionID, resp.GetCollectionID())
 	assert.Equal(t, dbName, resp.GetDbName())
 	assert.Equal(t, dbID, resp.GetDbId())
+	assert.Empty(t, request.GetCollectionName())
+	assert.Equal(t, collectionID, request.GetCollectionID())
 }
 
 func TestCachedProxyServiceProvider_DescribeCollection_FilterNamespaceField(t *testing.T) {
