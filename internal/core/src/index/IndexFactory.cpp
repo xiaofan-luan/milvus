@@ -19,6 +19,7 @@
 #include <assert.h>
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -629,21 +630,57 @@ IndexFactory::ScalarIndexLoadResource(
 
         request.has_raw_data = false;
     } else if (index_type == milvus::index::FMINDEX_INDEX_TYPE) {
-        // FM-index is a single flat blob. With mmap (default) it is streamed to
-        // a local file and viewed zero-copy (LoadView) — only small rank
-        // directories are rebuilt in RAM, so it is effectively disk-resident
-        // like INVERTED. Without mmap the blob is Deserialize'd into an owned
-        // buffer, so the whole index is resident (transiently ~2x while the
-        // read buffer and the owned copy coexist).
+        // FM-index is a single flat blob. With mmap it is streamed to a local
+        // file and LoadView'd — but "zero-copy" only covers the wavelet matrix
+        // and the sampled bitvector words. parseView still HEAP-copies the
+        // sampled SA values and doc_start_, and buildDerived() rebuilds
+        // isa_sample_ and the rank directories in RAM; the wrapper additionally
+        // keeps row_len_ (4 B/row) and the null bitmap. At the default
+        // fm_sa_sample_rate = 8 those heap parts are of the same order as the
+        // blob itself (sampled SA + ISA ≈ 2 x text_len/rate x 8 B), so the
+        // resident estimate must NOT be 0.
+        //
+        // Model (byte-mode index over text of m bytes, sample rate r):
+        //   file ≈ 1.125 m (wavelet + sampled bv, viewed) + 4 m / r (samples,
+        //          4 B narrow) + 8 rows (doc_start)
+        //   heap ≈ 16 m / r (sa_sample_vals_ + isa_sample_, 8 B each)
+        //          + m/16 (rank dirs) + ~12 B x rows (doc_start + row_len_
+        //          + null bitmap)
+        uint32_t sample_rate = 8;
+        auto rate_it =
+            index_params.find(std::string(milvus::index::FM_SA_SAMPLE_RATE));
+        if (rate_it != index_params.end()) {
+            auto parsed = std::atoll(rate_it->second.c_str());
+            if (parsed > 0) {
+                sample_rate = static_cast<uint32_t>(parsed);
+            }
+        }
+        const double per_row_bytes = 12.0 * static_cast<double>(num_rows);
+        // m from the file size: file ≈ (1.125 + 4/r) m + 8 rows.
+        const double m_est =
+            std::max(0.0,
+                     (static_cast<double>(index_size_in_bytes) -
+                      8.0 * static_cast<double>(num_rows))) /
+            (1.125 + 4.0 / static_cast<double>(sample_rate));
+        const auto mmap_resident_bytes = static_cast<uint64_t>(
+            16.0 * m_est / static_cast<double>(sample_rate) +  // SA + ISA
+            m_est / 16.0 +                                     // rank dirs
+            per_row_bytes);
         if (mmap_enable) {
-            request.final_memory_cost = 0;
+            request.final_memory_cost = mmap_resident_bytes;
             request.final_disk_cost = index_size_in_bytes;
-            request.max_memory_cost = stream_memory_overhead;
+            request.max_memory_cost =
+                mmap_resident_bytes + stream_memory_overhead;
             request.max_disk_cost = index_size_in_bytes;
         } else {
-            request.final_memory_cost = index_size_in_bytes;
+            // Deserialize keeps the whole blob owned in RAM (views point into
+            // it) PLUS the same derived heap parts; peak adds the transient
+            // read buffer while the owned copy is being made.
+            request.final_memory_cost =
+                index_size_in_bytes + mmap_resident_bytes;
             request.final_disk_cost = 0;
-            request.max_memory_cost = 2 * index_size_in_bytes;
+            request.max_memory_cost =
+                2 * index_size_in_bytes + mmap_resident_bytes;
             request.max_disk_cost = 0;
         }
         request.has_raw_data = false;

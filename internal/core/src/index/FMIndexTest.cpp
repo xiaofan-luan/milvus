@@ -121,6 +121,51 @@ TEST(FMIndex, EmptyPatternMatchesAllRows) {
     EXPECT_EQ(Inner(idx.get(), ""), all);
 }
 
+// ShouldUseOp is the executor's routing gate (UnaryIndexFunc): true routes the
+// op to this index, false downgrades to the raw-data scan. Range ops MUST be
+// declined — Range() throws Unsupported, so routing them here would fail the
+// query (`field > "x"`, BETWEEN) instead of scanning. Match/RegexMatch are not
+// answered exactly in v1 and must also decline.
+TEST(FMIndex, ShouldUseOpDeclinesRangeAndRegex) {
+    auto idx = MakeRawDataIndex({"apple", "banana"});
+
+    EXPECT_TRUE(idx->ShouldUseOp(proto::plan::OpType::PrefixMatch));
+    EXPECT_TRUE(idx->ShouldUseOp(proto::plan::OpType::PostfixMatch));
+    EXPECT_TRUE(idx->ShouldUseOp(proto::plan::OpType::InnerMatch));
+
+    EXPECT_FALSE(idx->ShouldUseOp(proto::plan::OpType::GreaterThan));
+    EXPECT_FALSE(idx->ShouldUseOp(proto::plan::OpType::GreaterEqual));
+    EXPECT_FALSE(idx->ShouldUseOp(proto::plan::OpType::LessThan));
+    EXPECT_FALSE(idx->ShouldUseOp(proto::plan::OpType::LessEqual));
+    EXPECT_FALSE(idx->ShouldUseOp(proto::plan::OpType::Match));
+    EXPECT_FALSE(idx->ShouldUseOp(proto::plan::OpType::RegexMatch));
+
+    // And the ops it declines to route would indeed throw if reached directly.
+    EXPECT_THROW(idx->Range("m", OpType::GreaterThan), SegcoreError);
+}
+
+// InnerMatch over rows that each contain the pattern MANY times: the result is
+// per-row (each matching row set once), and the streaming visitor path must
+// dedup repeated in-row occurrences without materializing them.
+TEST(FMIndex, InnerMatchDedupsRepeatedOccurrences) {
+    // row 0: "ababababab..." (50 occurrences of "ab")
+    // row 1: no match; row 2: one occurrence; row 3: "ab" x 200
+    std::string many0, many3;
+    for (int i = 0; i < 50; i++) {
+        many0 += "ab";
+    }
+    for (int i = 0; i < 200; i++) {
+        many3 += "ab";
+    }
+    auto idx = MakeRawDataIndex({many0, "zzzz", "xxabxx", many3});
+
+    EXPECT_EQ(Inner(idx.get(), "ab"), (std::vector<int64_t>{0, 2, 3}));
+    // single-char patterns, the degenerate high-frequency case
+    EXPECT_EQ(Inner(idx.get(), "a"), (std::vector<int64_t>{0, 2, 3}));
+    EXPECT_EQ(Inner(idx.get(), "z"), (std::vector<int64_t>{1}));
+    EXPECT_EQ(Inner(idx.get(), "x"), (std::vector<int64_t>{2}));
+}
+
 TEST(FMIndex, InNotInExactEquality) {
     std::vector<std::string> data{
         "apple", "apply", "banana", "grape", "application", "app", ""};

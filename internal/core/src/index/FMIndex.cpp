@@ -187,9 +187,20 @@ FMIndex::PatternMatch(const std::string& pattern, proto::plan::OpType op) {
         case proto::plan::OpType::PostfixMatch:
             return DocsToBitmap(
                 fm_.LocateSuffixDocs(bytes(pattern), pattern.size()));
-        case proto::plan::OpType::InnerMatch:
-            return DocsToBitmap(
-                fm_.MatchingDocs(bytes(pattern), pattern.size()));
+        case proto::plan::OpType::InnerMatch: {
+            // Streaming visitor, NOT MatchingDocs: the latter materializes
+            // O(occurrences) temporaries (positions + (doc,offset) pairs +
+            // doc ids), which for a high-frequency pattern (LIKE '%a%' over
+            // repetitive text) can transiently allocate GBs. The visitor
+            // dedups straight into the result bitmap — O(rows/8) memory
+            // regardless of the occurrence count.
+            TargetBitmap bitset(total_rows_);
+            fm_.VisitMatchingDocs(
+                bytes(pattern), pattern.size(), [&](uint64_t d) {
+                    bitset.set(d);
+                });
+            return bitset;
+        }
         default:
             ThrowInfo(ErrorCode::OpTypeInvalid,
                       "not supported op type: {} for FM index PatternMatch",

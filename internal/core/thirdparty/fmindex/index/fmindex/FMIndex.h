@@ -163,6 +163,31 @@ class FMIndex {
     std::vector<uint64_t>
     MatchingDocs(const uint8_t* pat, size_t plen) const;
 
+    // Streaming form of MatchingDocs: invoke `visit(doc_id)` for the document of
+    // every occurrence of `pat`, with NO per-occurrence materialization — O(1)
+    // extra memory instead of MatchingDocs' O(occurrences) temporaries (position
+    // array + (doc, offset) array + doc array). A document containing the
+    // pattern more than once is visited once per occurrence, in no particular
+    // order — callers dedup for free by setting bits in a docs-sized bitmap.
+    // This is what a scalar filter should use: a high-frequency pattern (e.g.
+    // LIKE '%a%' over repetitive text) makes MatchingDocs allocate GBs while
+    // this stays at the caller's single bitmap. An empty pattern visits nothing
+    // (as MatchingDocs).
+    template <typename Visitor>
+    void
+    VisitMatchingDocs(const uint8_t* pat, size_t plen, Visitor&& visit) const {
+        if (c_.empty() || plen == 0) {
+            return;
+        }
+        auto r = BackwardSearch(pat, plen);
+        for (size_t i = r.first; i < r.second; ++i) {
+            uint64_t pos = locateRow(i);
+            if (pos < text_len_) {  // skip the sentinel suffix
+                visit(docOf(pos));
+            }
+        }
+    }
+
     // Sorted, unique document ids containing a substring within edit distance
     // <= k of `pat` (typo / variant tolerant: names, domains, codes). Also
     // doc-granularity. Implemented by backtracking backward search that never
