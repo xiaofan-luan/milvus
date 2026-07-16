@@ -1545,6 +1545,16 @@ LoadIndexData(milvus::tracer::TraceContext& ctx,
         index_info.ngram_params = std::make_optional(ngram_params);
     }
 
+    if (index_info.index_type == milvus::index::FMINDEX_INDEX_TYPE) {
+        milvus::index::FMIndexParams fmindex_params{};
+        fmindex_params.loading_index = true;
+        fmindex_params.sa_sample_rate = static_cast<uint32_t>(
+            std::stoul(milvus::index::GetValueFromConfig<std::string>(
+                           config, milvus::index::FM_SA_SAMPLE_RATE)
+                           .value_or("8")));
+        index_info.fmindex_params = std::make_optional(fmindex_params);
+    }
+
     // init file manager
     milvus::storage::FieldDataMeta field_meta{load_index_info->collection_id,
                                               load_index_info->partition_id,

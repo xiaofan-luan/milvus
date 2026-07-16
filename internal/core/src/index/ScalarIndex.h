@@ -46,6 +46,7 @@ enum class ScalarIndexType {
     JSONSTATS,
     RTREE,
     NGRAM,
+    FMINDEX,
 };
 
 inline std::string
@@ -67,6 +68,8 @@ ToString(ScalarIndexType type) {
             return "RTREE";
         case ScalarIndexType::NGRAM:
             return "NGRAM";
+        case ScalarIndexType::FMINDEX:
+            return "FMINDEX";
         default:
             return "UNKNOWN";
     }
@@ -88,6 +91,8 @@ FromString(const std::string& type) {
         return ScalarIndexType::RTREE;
     } else if (type == "NGRAM") {
         return ScalarIndexType::NGRAM;
+    } else if (type == "FMINDEX") {
+        return ScalarIndexType::FMINDEX;
     } else {
         return ScalarIndexType::NONE;
     }
@@ -182,7 +187,8 @@ class ScalarIndex : public IndexBase {
                index_type_ == milvus::index::INVERTED_INDEX_TYPE ||
                index_type_ == milvus::index::MARISA_TRIE ||
                index_type_ == milvus::index::MARISA_TRIE_UPPER ||
-               index_type_ == milvus::index::ASCENDING_SORT;
+               index_type_ == milvus::index::ASCENDING_SORT ||
+               index_type_ == milvus::index::FMINDEX_INDEX_TYPE;
     }
 
     bool

@@ -27,6 +27,11 @@ struct NgramParams {
     uintptr_t max_gram;
 };
 
+struct FMIndexParams {
+    bool loading_index;
+    uint32_t sa_sample_rate;  // suffix-array sampling rate (default 8)
+};
+
 struct CreateIndexInfo {
     DataType field_type;
     IndexType index_type;
@@ -40,6 +45,7 @@ struct CreateIndexInfo {
     std::string json_path;
     std::string json_cast_function{UNKNOW_CAST_FUNCTION_NAME};
     std::optional<NgramParams> ngram_params{std::nullopt};
+    std::optional<FMIndexParams> fmindex_params{std::nullopt};
     bool is_text_match{false};
     std::string analyzer_extra_info;
 };

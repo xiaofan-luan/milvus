@@ -43,6 +43,7 @@
 #include "index/JsonFlatIndex.h"
 #include "index/JsonHybridScalarIndex.h"
 #include "index/JsonScalarIndexWrapper.h"
+#include "index/FMIndex.h"
 #include "index/Meta.h"
 #include "index/NgramInvertedIndex.h"
 #include "index/RTreeIndex.h"
@@ -627,6 +628,25 @@ IndexFactory::ScalarIndexLoadResource(
         request.max_disk_cost = index_size_in_bytes;
 
         request.has_raw_data = false;
+    } else if (index_type == milvus::index::FMINDEX_INDEX_TYPE) {
+        // FM-index is a single flat blob. With mmap (default) it is streamed to
+        // a local file and viewed zero-copy (LoadView) — only small rank
+        // directories are rebuilt in RAM, so it is effectively disk-resident
+        // like INVERTED. Without mmap the blob is Deserialize'd into an owned
+        // buffer, so the whole index is resident (transiently ~2x while the
+        // read buffer and the owned copy coexist).
+        if (mmap_enable) {
+            request.final_memory_cost = 0;
+            request.final_disk_cost = index_size_in_bytes;
+            request.max_memory_cost = stream_memory_overhead;
+            request.max_disk_cost = index_size_in_bytes;
+        } else {
+            request.final_memory_cost = index_size_in_bytes;
+            request.final_disk_cost = 0;
+            request.max_memory_cost = 2 * index_size_in_bytes;
+            request.max_disk_cost = 0;
+        }
+        request.has_raw_data = false;
     } else if (index_type == milvus::index::BITMAP_INDEX_TYPE) {
         if (mmap_enable) {
             // V3 streaming: stream to temp file (mmap'd), then MMapIndexData
@@ -776,6 +796,11 @@ IndexFactory::CreatePrimitiveScalarIndex(
             if (ngram_params.has_value()) {
                 return std::make_unique<NgramInvertedIndex>(
                     file_manager_context, ngram_params.value());
+            }
+            auto& fmindex_params = create_index_info.fmindex_params;
+            if (fmindex_params.has_value()) {
+                return std::make_unique<FMIndex>(file_manager_context,
+                                                 fmindex_params.value());
             }
             return CreatePrimitiveScalarIndex<std::string>(
                 create_index_info, file_manager_context);

@@ -58,6 +58,14 @@ ScalarIndexCreator::ScalarIndexCreator(
                                config, milvus::index::MAX_GRAM)
                                .value());
             index_info.ngram_params = std::make_optional(ngram_params);
+        } else if (index_type_ == milvus::index::FMINDEX_INDEX_TYPE) {
+            milvus::index::FMIndexParams fmindex_params{};
+            fmindex_params.loading_index = false;
+            fmindex_params.sa_sample_rate = static_cast<uint32_t>(
+                std::stoul(milvus::index::GetValueFromConfig<std::string>(
+                               config, milvus::index::FM_SA_SAMPLE_RATE)
+                               .value_or("8")));
+            index_info.fmindex_params = std::make_optional(fmindex_params);
         }
     }
     // Config should have value for milvus::index::SCALAR_INDEX_ENGINE_VERSION for production calling chain.
