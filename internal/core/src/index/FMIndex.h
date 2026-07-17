@@ -150,29 +150,67 @@ class FMIndex : public ScalarIndex<std::string> {
     const TargetBitmap
     PatternMatch(const std::string& pattern, proto::plan::OpType op) override;
 
+    // Count-first guard constant: enumeration costs ~ occ x sa_sample_rate
+    // RANDOM LF steps (each a cache miss on the wavelet); a scan streams the
+    // corpus bytes SEQUENTIALLY (memchr-fast). kFMIndexCostRatio is the
+    // measured random-step / sequential-byte price ratio: crossover measured
+    // at occ x sr / tokens ~= 0.0008 on 1 GiB of per-row random text
+    // (cache-adversarial for LF, memchr-friendly for the scan) and
+    // ~0.002-0.008 on repetitive corpora — 0.001 takes the conservative end,
+    // so the index is never left slower than the scan it replaces.
+    // TODO: surface as queryNode.fmindexCostRatio via the SegcoreConfig
+    // pipeline (follow-up); the constant is the measured default.
+    static constexpr double kFMIndexCostRatio = 0.001;
+
     bool
     SupportPatternMatch() const override {
         return true;
     }
 
-    // Routing gate for the executor (UnaryIndexFunc via CanUseIndexForOp).
-    // ALLOWLIST with a false default: declining an op merely downgrades to the
-    // raw-data scan (correct, just slower), while wrongly accepting one routes
-    // it into a method that throws (Range() is Unsupported; PatternMatch
-    // rejects Match/RegexMatch) and FAILS the query. So the safe default for
-    // any op not explicitly supported — including ops added to the enum in the
-    // future — is false. The allowlist mirrors UnaryIndexFunc's dispatch:
-    // Equal -> In, NotEqual -> NotIn, and the three anchored pattern ops ->
-    // PatternMatch, all of which this index answers exactly.
+    // Routing gate for the executor (UnaryIndexFunc via CanUseIndexForOp),
+    // deciding in two stages inside ONE call:
+    //
+    // 1. Op ALLOWLIST with a false default: declining an op merely downgrades
+    //    to the raw-data scan (correct, just slower), while wrongly accepting
+    //    one routes it into a method that throws (Range() is Unsupported;
+    //    PatternMatch rejects Match/RegexMatch) and FAILS the query. So the
+    //    safe default for any op not explicitly supported — including future
+    //    enum additions — is false. The allowlist mirrors UnaryIndexFunc's
+    //    dispatch: Equal -> In, NotEqual -> NotIn, anchored pattern ops ->
+    //    PatternMatch, all answered exactly.
+    //
+    // 2. Count-first guard on the anchored pattern ops, when the caller
+    //    passed the concrete literal: enumeration costs occ x sa_sample_rate
+    //    random LF steps, the scan streams TotalTokens() bytes sequentially —
+    //    accelerate iff occ x sr < kFMIndexCostRatio x tokens. The count is
+    //    O(|pattern|) backward search (microseconds, no locate). A high-hit
+    //    literal (LIKE '%a%' over most rows) therefore declines and the expr
+    //    runs the scan — exact either way, this only picks the cheaper path.
+    //    An empty pattern means EITHER `LIKE '%'` (answered by an O(rows)
+    //    bitmap clone, always accelerate) OR a caller without literal
+    //    information — both accelerate, so no flag is needed to tell them
+    //    apart.
     bool
-    ShouldUseOp(proto::plan::OpType op) const override {
+    ShouldUseOp(proto::plan::OpType op,
+                const std::string& pattern = "") const override {
         switch (op) {
             case proto::plan::OpType::Equal:
             case proto::plan::OpType::NotEqual:
+                return true;
             case proto::plan::OpType::PrefixMatch:
             case proto::plan::OpType::PostfixMatch:
-            case proto::plan::OpType::InnerMatch:
-                return true;
+            case proto::plan::OpType::InnerMatch: {
+                if (pattern.empty()) {
+                    return true;
+                }
+                int64_t occ = PatternCount(pattern, op);
+                if (occ < 0) {
+                    return true;
+                }
+                return static_cast<double>(occ) *
+                           static_cast<double>(sa_sample_rate_) <
+                       kFMIndexCostRatio * static_cast<double>(TotalTokens());
+            }
             // Notable declines: general LIKE (Match) / RegexMatch are not
             // answered exactly in v1; lexicographic range (GT/GE/LT/LE) needs
             // forward navigation the FM-index does not carry.
@@ -205,6 +243,48 @@ class FMIndex : public ScalarIndex<std::string> {
     }
 
  private:
+    // Occurrence/document count for `pattern` under `op`, answered by backward
+    // search ALONE — O(|pattern|), NO suffix-array locate. The guard's input:
+    // Prefix/PostfixMatch return the exact matching-document count; InnerMatch
+    // returns the occurrence count, an upper bound on matching rows (a row may
+    // contain the pattern more than once — the bias only makes the guard
+    // decline earlier, the safe direction). Returns -1 for uncounted ops.
+    int64_t
+    PatternCount(const std::string& pattern, proto::plan::OpType op) const {
+        auto* p = reinterpret_cast<const uint8_t*>(pattern.data());
+        switch (op) {
+            case proto::plan::OpType::PrefixMatch:
+                return static_cast<int64_t>(
+                    fm_.CountPrefixDocs(p, pattern.size()));
+            case proto::plan::OpType::PostfixMatch:
+                return static_cast<int64_t>(
+                    fm_.CountSuffixDocs(p, pattern.size()));
+            case proto::plan::OpType::InnerMatch:
+                return static_cast<int64_t>(fm_.Count(p, pattern.size()));
+            default:
+                return -1;
+        }
+    }
+
+    // Total byte length over all non-null rows — the text a brute scan would
+    // stream. The guard normalizes occ by TOKENS, not rows: scan cost tracks
+    // bytes, so an occ/rows threshold would drift with row length while
+    // occ/tokens does not. Lazily computed from the per-row lengths (null rows
+    // carry a sentinel length and are skipped).
+    int64_t
+    TotalTokens() const {
+        if (total_tokens_ < 0) {
+            int64_t t = 0;
+            for (int64_t i = 0; i < total_rows_; i++) {
+                if (!null_bitmap_[i]) {
+                    t += row_len_[i];
+                }
+            }
+            total_tokens_ = t;
+        }
+        return total_tokens_;
+    }
+
     // Turn a sorted, unique list of matching doc ids into a bitmap over rows.
     TargetBitmap
     DocsToBitmap(const std::vector<uint64_t>& docs) const;
@@ -227,6 +307,10 @@ class FMIndex : public ScalarIndex<std::string> {
 
     // number of rows indexed (one document per row, including nulls)
     int64_t total_rows_{0};
+
+    // total non-null byte length (the guard's scan-cost proxy); lazy, -1 = not
+    // yet computed. Mutable: TotalTokens() is called from const query context.
+    mutable int64_t total_tokens_{-1};
 
     // byte length of each row's value (0 for null). Used by In/NotIn to turn a
     // prefix hit into an exact whole-string equality test.

@@ -285,18 +285,18 @@ default result granularity is PK-deduplicated document membership, with raw
 per-occurrence counts opt-in. Batched scoring of thousands of n-grams rides
 `CountBatch` (~1 M patterns/s per segment).
 
-## Cost Model and Adaptive Execution (PR-2, not in this PR)
-
-> This section is the **design** for the count-first guard, planned for PR-2.
-> The primitives and executor wiring are **not** part of this PR — this PR
-> ships the index and its exact query path only.
+## Cost Model and Adaptive Execution (wired in this PR)
 
 Backward search makes the index **self-costing**: a substring count is exact
 and costs `O(|P|)` (~7 µs at 1 GiB) *before* any enumeration is attempted, via
 the library's `Count`/`CountPrefixDocs`/`CountSuffixDocs` (no suffix-array
-locate). PR-2 adds a `CanAccelerate(pattern, op)` guard — the FMINDEX analog of
-NGRAM's `CanHandleLiteral` — that runs the count and declines when enumeration
-would lose to a scan:
+locate). The count-first guard lives INSIDE the single routing gate
+`ShouldUseOp(op, pattern)`: the executor's
+`PhyUnaryRangeFilterExpr::DetermineExecPath` passes the concrete literal for
+the anchored pattern ops, and FMINDEX's override runs the count and declines
+when enumeration would lose to a scan (the expr downgrades to the RawData
+path — both paths are exact, the gate only picks the cheaper executor). An
+empty pattern means "no literal information" and is judged on the op alone:
 
 - Enumeration cost ≈ `occ × sa_sample_rate` LF steps (random access).
 - Scan cost ≈ segment text bytes (sequential) — proportional to the **total
@@ -554,7 +554,7 @@ Future work enabled by capabilities already in the library:
 |---|---|---|---|
 | `fm_sa_sample_rate` | 8 | [4, 256] | SA sampling: space vs. locate latency. No effect on `Count`. Default 8 is locate-tuned (~7-10× faster locate than 32, ~30% larger index); raise to 64+ for count-only workloads |
 | `mmap.enabled` | collection/field setting | — | zero-copy view load |
-| `queryNode.fmindexCostRatio` (config, not index param) — **PR-2, not wired in this PR** | 0.001 | (0, 1] | guard: brute-scan instead of enumerate when `occ × sa_sample_rate ≥ active_tokens × this`. Normalized by tokens (bytes), **not rows**, so it is row-length invariant. Measured crossover: ~0.002 (repetitive/short rows) down to ~0.0008 (random text, cache-adversarial for LF walks) — default 0.001 takes the conservative end |
+| `fmindexCostRatio` — **wired as a constant** (`FMIndex::kFMIndexCostRatio`); surfacing as `queryNode.fmindexCostRatio` config is a follow-up | 0.001 | (0, 1] | guard: brute-scan instead of enumerate when `occ × sa_sample_rate ≥ active_tokens × this`. Normalized by tokens (bytes), **not rows**, so it is row-length invariant. Measured crossover: ~0.002 (repetitive/short rows) down to ~0.0008 (random text, cache-adversarial for LF walks) — default 0.001 takes the conservative end |
 
 Reserved for future: `case_insensitive` (see above).
 

@@ -163,6 +163,48 @@ TEST(FMIndex, ShouldUseOpDeclinesRangeAndRegex) {
     EXPECT_THROW(idx->Range("m", OpType::GreaterThan), SegcoreError);
 }
 
+// Count-first guard, folded into ShouldUseOp(op, pattern): for the anchored
+// pattern ops with a literal in hand, accelerate iff
+// occ x sa_sample_rate < kFMIndexCostRatio x total_tokens. With 1000 rows x
+// ~500 B (~500k tokens) and the test helper's sa_sample_rate = 32, the
+// decline threshold is occ >= 500k x 0.001 / 32 ~= 15.6 occurrences.
+TEST(FMIndex, CountFirstGuardDeclinesHighHitPatterns) {
+    std::vector<std::string> data;
+    std::string filler(500, 'x');  // marker letters never occur in the filler
+    data.reserve(1000);
+    for (int i = 0; i < 1000; i++) {
+        std::string row = filler;
+        if (i % 200 == 0) {
+            row += "RARE";  // 5 rows -> occ 5, well under the threshold
+        }
+        if (i % 2 == 0) {
+            row += "COMMON";  // 500 rows -> occ 500, well over
+        }
+        data.push_back(std::move(row));
+    }
+    auto idx = MakeRawDataIndex(data);
+
+    // Low-hit pattern: index wins, guard accelerates.
+    EXPECT_TRUE(idx->ShouldUseOp(proto::plan::OpType::InnerMatch, "RARE"));
+    // High-hit pattern (50% of rows): enumeration loses to the scan, decline.
+    EXPECT_FALSE(idx->ShouldUseOp(proto::plan::OpType::InnerMatch, "COMMON"));
+    // Degenerate single-char pattern (~500k occurrences): decline.
+    EXPECT_FALSE(idx->ShouldUseOp(proto::plan::OpType::InnerMatch, "x"));
+    // Absent pattern: occ = 0, cheapest possible index answer — accelerate.
+    EXPECT_TRUE(idx->ShouldUseOp(proto::plan::OpType::InnerMatch, "QQQQ"));
+    // Empty literal (LIKE '%', or a caller without literal information):
+    // always accelerate — answered by an O(rows) bitmap clone.
+    EXPECT_TRUE(idx->ShouldUseOp(proto::plan::OpType::PrefixMatch, ""));
+    // Uncounted/declined op: the literal cannot rescue it.
+    EXPECT_FALSE(idx->ShouldUseOp(proto::plan::OpType::Match, "zz"));
+    // Anchored variants count docs, not occurrences.
+    EXPECT_FALSE(idx->ShouldUseOp(proto::plan::OpType::PrefixMatch,
+                                  "x"));  // every row starts with x
+    EXPECT_TRUE(idx->ShouldUseOp(proto::plan::OpType::PostfixMatch, "RARE"));
+    // Equal/NotEqual accelerate regardless of literal (In/NotIn path).
+    EXPECT_TRUE(idx->ShouldUseOp(proto::plan::OpType::Equal, "COMMON"));
+}
+
 // Library-level: a LoadView'd (zero-copy) index must answer doc queries with
 // nothing but the mapped bytes, and Extract — the only consumer of the lazily
 // built ISA table — must still work after the view-load (first call builds it).
@@ -442,6 +484,12 @@ TEST(FMIndex, NullVsEmptyStringDistinctAfterReload) {
 //     transparently fall back to the raw-data scan — correct rows, NO throw;
 //   - ops it accepts (anchored LIKE, equality, `LIKE '%'` lowered to
 //     PrefixMatch("")) must return exactly the scan's rows.
+// Note on the count-first guard: on this tiny corpus (~50 tokens) the guard
+// declines every non-empty anchored pattern (a scan of 50 bytes always beats
+// enumeration), so the anchored cases below ALSO exercise the guard-declined
+// RawData path end-to-end; the empty-literal case (always accelerated) keeps
+// the index path covered. Either path must produce identical rows — that
+// invariance is exactly what this test pins.
 TEST(FMIndex, ExecutorPathDeclinedOpsFallBackToScan) {
     int64_t collection_id = 1, partition_id = 2, segment_id = 3;
     int64_t index_build_id = 6001, index_version = 6001, index_id = 7001;

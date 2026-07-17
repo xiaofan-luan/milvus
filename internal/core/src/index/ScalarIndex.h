@@ -203,8 +203,19 @@ class ScalarIndex : public IndexBase {
     // index directly. Pattern ops need extra capability checks:
     // - PatternMatch is the public index capability for all pattern ops.
     // - PatternQuery is an implementation detail used inside PatternMatch.
+    // Routing gate for the executor: should `op` — with the concrete query
+    // literal in `pattern`, when the caller has one — run through this index,
+    // or fall back to the raw-data scan? `pattern` lets an index that can
+    // bound the match cardinality cheaply (FMINDEX's O(|pattern|) count)
+    // decline degenerate high-hit literals (e.g. LIKE '%a%' matching most
+    // rows) whose enumeration would lose to the scan — correct either way,
+    // the gate only picks the cheaper executor. Callers without a literal
+    // (non-pattern ops, tests) omit it; overrides must treat an empty pattern
+    // as "no literal information" and answer on the op alone. NOTE: overrides
+    // repeat the `= ""` default — keep the values identical (a differing
+    // default on a virtual is the classic static-binding trap).
     virtual bool
-    ShouldUseOp(proto::plan::OpType op) const {
+    ShouldUseOp(proto::plan::OpType op, const std::string& pattern = "") const {
         switch (op) {
             case proto::plan::OpType::Match:
             case proto::plan::OpType::PrefixMatch:

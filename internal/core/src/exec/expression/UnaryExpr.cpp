@@ -2034,10 +2034,23 @@ PhyUnaryRangeFilterExpr::DetermineExecPath() {
             can_use = SegmentExpr::CanUseIndexForOp<double>(expr_->op_type_);
             break;
         case DataType::VARCHAR:
-        case DataType::TEXT:
-            can_use =
-                SegmentExpr::CanUseIndexForOp<std::string>(expr_->op_type_);
+        case DataType::TEXT: {
+            // Pass the query literal for the pattern ops so an index with a
+            // cheap per-literal cost bound (FMINDEX's count-first guard) can
+            // decline degenerate high-hit patterns (LIKE '%a%' over most
+            // rows) whose enumeration would lose to the raw-data scan.
+            // Declining downgrades to RawData — both paths are exact, this
+            // only picks the cheaper one.
+            std::string pattern;
+            if (expr_->op_type_ == proto::plan::PrefixMatch ||
+                expr_->op_type_ == proto::plan::PostfixMatch ||
+                expr_->op_type_ == proto::plan::InnerMatch) {
+                pattern = GetValueFromProto<std::string>(expr_->val_);
+            }
+            can_use = SegmentExpr::CanUseIndexForOp<std::string>(
+                expr_->op_type_, pattern);
             break;
+        }
         case DataType::JSON: {
             auto val_type = FromValCase(expr_->val_.val_case());
             switch (val_type) {
