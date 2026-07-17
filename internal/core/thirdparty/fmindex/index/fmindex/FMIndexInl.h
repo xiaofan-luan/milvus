@@ -43,13 +43,13 @@ FMIndex::Build(const std::vector<std::string_view>& docs,
     // coordinate system (one symbol per content byte, one per separator) is
     // identical to the byte offsets, so doc_start_ / text_len_ are byte offsets.
     uint64_t internal_len = 0;
-    doc_start_.clear();
-    doc_start_.reserve(docs.size() + 1);
+    doc_bounds_owned_.clear();
+    doc_bounds_owned_.reserve(docs.size() + 1);
     for (const auto& d : docs) {
-        doc_start_.push_back(internal_len);
+        doc_bounds_owned_.push_back(internal_len);
         internal_len += d.size() + 1;  // content + one separator
     }
-    doc_start_.push_back(internal_len);  // end boundary (== internal_len)
+    doc_bounds_owned_.push_back(internal_len);  // end boundary (== internal_len)
     const size_t len = static_cast<size_t>(internal_len);
 
     // Suffix array is built with 32-bit indices under 2 GiB (compact) and 64-bit
@@ -168,13 +168,13 @@ FMIndex::Build(const std::vector<std::string_view>& docs,
     // 5. sampled SA (needs the SA, not the BWT): do it before the wavelet so the
     //    SA can be freed and does not stack onto the wavelet's peak memory.
     BitVector samp(m);
-    sa_sample_vals_.clear();
-    sa_sample_vals_.reserve(m / sa_sample_rate_ + 1);
+    sample_vals_owned_.clear();
+    sample_vals_owned_.reserve(m / sa_sample_rate_ + 1);
     for (size_t i = 0; i < m; ++i) {
         uint64_t v = sa_at(i);
         if (v % sa_sample_rate_ == 0) {
             samp.set(i);
-            sa_sample_vals_.push_back(v);
+            sample_vals_owned_.push_back(v);
         }
     }
     samp.build_rank();
@@ -193,6 +193,14 @@ FMIndex::Build(const std::vector<std::string_view>& docs,
         first_[c] = wm_.map_zero(c);
     }
 
+    // Point the access views at the owned storage. Vector moves keep their heap
+    // buffer address, so these stay valid when the whole FMIndex is moved.
+    sv_wide_ = sample_vals_owned_.data();
+    sv_narrow_ = nullptr;
+    n_samples_ = sample_vals_owned_.size();
+    doc_start_ = doc_bounds_owned_.data();
+    n_doc_bounds_ = doc_bounds_owned_.size();
+
     buildDerived();
 }
 
@@ -210,25 +218,34 @@ FMIndex::buildDerived() {
     // The separator is a fixed synthetic symbol (dense id 1), not a byte. No
     // byte_to_id_ entry equals 1, so a query byte can never step onto it.
     sep_id_ = 1;
+}
+
+inline void
+FMIndex::ensureIsaSample() const {
     // isa_sample_[k] = the BWT row whose suffix starts at text position k*rate.
     // Every multiple of rate in [0, text_len_] appears exactly once in the SA,
     // so this array is fully populated. Gives Extract an anchor within `rate`
-    // steps of any position without needing select/psi.
-    const size_t m = text_len_ + 1;
-    isa_sample_.assign(text_len_ / sa_sample_rate_ + 1, 0);
-    for (size_t r = 0; r < m; ++r) {
-        if (sampled_bv_.get(r)) {
-            uint64_t val = sa_sample_vals_[sampled_bv_.rank1(r)];
-            isa_sample_[val / sa_sample_rate_] = static_cast<uint64_t>(r);
+    // steps of any position without needing select/psi. Built lazily on the
+    // first Extract — the build walks ALL m rows and allocates m/rate x 8 B, a
+    // cost Locate/Count workloads should never pay.
+    std::call_once(*isa_once_, [this] {
+        const size_t m = text_len_ + 1;
+        isa_sample_.assign(text_len_ / sa_sample_rate_ + 1, 0);
+        for (size_t r = 0; r < m; ++r) {
+            if (sampled_bv_.get(r)) {
+                uint64_t val = sample_val(sampled_bv_.rank1(r));
+                isa_sample_[val / sa_sample_rate_] = static_cast<uint64_t>(r);
+            }
         }
-    }
+    });
 }
 
 inline std::string
 FMIndex::Extract(uint64_t doc_id, uint64_t offset, size_t len) const {
-    if (c_.empty() || doc_id + 1 >= doc_start_.size()) {
+    if (c_.empty() || doc_id + 1 >= n_doc_bounds_) {
         return {};  // empty index or doc_id out of range
     }
+    ensureIsaSample();  // lazy: only Extract pays for the ISA anchor table
     // Translate (doc, offset) to internal coordinates and clamp to the document's
     // content end (the byte before its '\0'), so Extract never crosses into the
     // separator or the next document.
@@ -421,7 +438,7 @@ FMIndex::FuzzyMatchingDocs(const uint8_t* pat, size_t plen, uint32_t k) const {
                 row = LF(row);
                 ++steps;
             }
-            uint64_t pos = sa_sample_vals_[sampled_bv_.rank1(row)] + steps;
+            uint64_t pos = sample_val(sampled_bv_.rank1(row)) + steps;
             if (pos < text_len_) {
                 docset.insert(docOf(pos));
             }
@@ -543,9 +560,9 @@ FMIndex::CountBatch(
 
 inline uint64_t
 FMIndex::docOf(uint64_t internal_pos) const {
-    auto it =
-        std::upper_bound(doc_start_.begin(), doc_start_.end(), internal_pos);
-    return static_cast<uint64_t>(it - doc_start_.begin()) - 1;
+    const uint64_t* end = doc_start_ + n_doc_bounds_;
+    auto it = std::upper_bound(doc_start_, end, internal_pos);
+    return static_cast<uint64_t>(it - doc_start_) - 1;
 }
 
 inline uint64_t
@@ -555,7 +572,7 @@ FMIndex::locateRow(size_t row) const {
         row = LF(row);
         ++steps;
     }
-    return sa_sample_vals_[sampled_bv_.rank1(row)] + steps;
+    return sample_val(sampled_bv_.rank1(row)) + steps;
 }
 
 inline std::vector<uint64_t>
@@ -640,7 +657,7 @@ FMIndex::LocateDocsBatch(
                 }
                 if (sampled_bv_.get(walks[gi].row)) {
                     pos_flat[gi] =
-                        sa_sample_vals_[sampled_bv_.rank1(walks[gi].row)] +
+                        sample_val(sampled_bv_.rank1(walks[gi].row)) +
                         walks[gi].steps;
                     done[gi] = 1;
                     continue;
@@ -792,7 +809,8 @@ FMIndex::LocateSuffixDocs(const uint8_t* pattern, size_t plen) const {
 // Format v3: a header of scalars/metadata/section-sizes, then the large payload
 // arrays each padded to an 8-byte boundary so LoadView can point at them
 // (zero-copy) from mmap'd memory. Only the wavelet/sampled word arrays are
-// viewed; the small sample/doc arrays are copied on load either way.
+// viewed, and so are the sampled-SA values and doc boundaries (via width-aware
+// accessors) — a load copies nothing; only rank directories are rebuilt.
 template <typename T>
 void
 put(std::string& s, const T& v) {
@@ -843,8 +861,8 @@ FMIndex::writeHeader(std::string& s) const {
         put(s, static_cast<uint64_t>(wm_.levels_qv()[l].word_count()));
     }
     put(s, static_cast<uint64_t>(sampled_bv_.word_count()));
-    put(s, static_cast<uint64_t>(sa_sample_vals_.size()));
-    put(s, static_cast<uint64_t>(doc_start_.size()));
+    put(s, static_cast<uint64_t>(n_samples_));
+    put(s, static_cast<uint64_t>(n_doc_bounds_));
 }
 
 inline std::string
@@ -867,17 +885,19 @@ FMIndex::Serialize() const {
              sampled_bv_.word_count() * sizeof(uint64_t));
     align8();
     if (wide_storage_) {
-        s.append(reinterpret_cast<const char*>(sa_sample_vals_.data()),
-                 sa_sample_vals_.size() * sizeof(uint64_t));
+        // Wide storage always has an 8-byte array behind sv_wide_ (owned after
+        // Build, viewed after a wide load) — appendable as-is.
+        s.append(reinterpret_cast<const char*>(sv_wide_),
+                 n_samples_ * sizeof(uint64_t));
     } else {
-        for (uint64_t v : sa_sample_vals_) {
-            uint32_t x = static_cast<uint32_t>(v);
+        for (size_t i = 0; i < n_samples_; ++i) {
+            uint32_t x = static_cast<uint32_t>(sample_val(i));
             s.append(reinterpret_cast<const char*>(&x), sizeof(x));
         }
     }
     align8();
-    s.append(reinterpret_cast<const char*>(doc_start_.data()),
-             doc_start_.size() * sizeof(uint64_t));
+    s.append(reinterpret_cast<const char*>(doc_start_),
+             n_doc_bounds_ * sizeof(uint64_t));
     return s;
 }
 
@@ -911,15 +931,15 @@ FMIndex::SerializeToFile(const std::string& path) const {
     emit(sampled_bv_.words(), sampled_bv_.word_count() * sizeof(uint64_t));
     pad8();
     if (wide_storage_) {
-        emit(sa_sample_vals_.data(), sa_sample_vals_.size() * sizeof(uint64_t));
+        emit(sv_wide_, n_samples_ * sizeof(uint64_t));
     } else {
-        for (uint64_t v : sa_sample_vals_) {
-            uint32_t x = static_cast<uint32_t>(v);
+        for (size_t i = 0; i < n_samples_; ++i) {
+            uint32_t x = static_cast<uint32_t>(sample_val(i));
             emit(&x, sizeof(x));
         }
     }
     pad8();
-    emit(doc_start_.data(), doc_start_.size() * sizeof(uint64_t));
+    emit(doc_start_, n_doc_bounds_ * sizeof(uint64_t));
     std::fclose(f);
     return ok;
 }
@@ -1043,46 +1063,50 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
         const uint64_t* sw = align_view(sampled_nw * sizeof(uint64_t));
         sampled_bv_ = BitVector::from_view(m, sw, sampled_nw);
         // The set-bit count must equal the number of sampled values; otherwise
-        // sa_sample_vals_[sampled_bv_.rank1(row)] could index past the array.
+        // sample_val(sampled_bv_.rank1(row)) could index past the array.
         if (sampled_bv_.count_ones() != n_samples) {
             return false;
         }
-        // small arrays copied (cheap, keeps them owned/aligned-independent)
+        // Sampled-SA values and doc boundaries are VIEWED in place, in whatever
+        // width they were stored — no heap copy. At the default sample rate the
+        // sample array alone is of the same order as the whole blob; copying it
+        // (and rebuilding an equally-large ISA table) made the mmap load far
+        // from zero-copy. Validation below reads the views once, allocates
+        // nothing.
         const size_t pw = wide_storage_ ? 8 : 4;
         const uint64_t* svp = align_view(n_samples * pw);
-        sa_sample_vals_.resize(n_samples);
-        if (pw == 8) {
-            std::memcpy(
-                sa_sample_vals_.data(), svp, n_samples * sizeof(uint64_t));
+        if (wide_storage_) {
+            sv_wide_ = svp;
+            sv_narrow_ = nullptr;
         } else {
-            const uint32_t* s32 = reinterpret_cast<const uint32_t*>(svp);
-            for (uint64_t i = 0; i < n_samples; ++i) {
-                sa_sample_vals_[i] = s32[i];
-            }
+            sv_narrow_ = reinterpret_cast<const uint32_t*>(svp);
+            sv_wide_ = nullptr;
         }
+        n_samples_ = static_cast<size_t>(n_samples);
         // Sampled values are text positions in [0, text_len_]; a larger value
-        // would drive buildDerived's isa_sample_[val/rate] write out of bounds.
-        for (uint64_t v : sa_sample_vals_) {
-            if (v > text_len_) {
+        // would drive ensureIsaSample's isa_sample_[val/rate] write out of
+        // bounds on a later Extract.
+        for (size_t i = 0; i < n_samples_; ++i) {
+            if (sample_val(i) > text_len_) {
                 return false;
             }
         }
         const uint64_t* dsp = align_view(n_docs * sizeof(uint64_t));
-        doc_start_.resize(n_docs);
-        std::memcpy(doc_start_.data(), dsp, n_docs * sizeof(uint64_t));
+        doc_start_ = dsp;
+        n_doc_bounds_ = static_cast<size_t>(n_docs);
         // doc_start_ must be a valid boundary list: start at 0, be strictly
         // increasing (each document adds at least its separator), and end at
         // text_len_. Otherwise docOf's upper_bound could underflow to a bogus
         // document id and read c_/doc_start_ out of bounds during a query.
-        if (doc_start_.front() != 0 || doc_start_.back() != text_len_) {
+        if (doc_start_[0] != 0 || doc_start_[n_doc_bounds_ - 1] != text_len_) {
             return false;
         }
-        for (size_t i = 1; i < doc_start_.size(); ++i) {
+        for (size_t i = 1; i < n_doc_bounds_; ++i) {
             if (doc_start_[i] <= doc_start_[i - 1]) {
                 return false;
             }
         }
-        buildDerived();  // id_to_byte_, isa_sample_ (in-RAM only)
+        buildDerived();  // id_to_byte_ only; isa_sample_ is lazy (Extract)
         return true;
     } catch (const std::exception&) {
         return false;

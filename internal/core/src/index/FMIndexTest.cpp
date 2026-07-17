@@ -12,8 +12,12 @@
 #include <fmt/core.h>
 #include <gtest/gtest.h>
 
+#include <cstring>
+#include <functional>
+#include <map>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "common/Consts.h"
@@ -23,8 +27,16 @@
 #include "index/FMIndex.h"
 #include "index/IndexInfo.h"
 #include "index/Meta.h"
+#include "common/type_c.h"
 #include "pb/common.pb.h"
 #include "pb/plan.pb.h"
+#include "pb/schema.pb.h"
+#include "plan/PlanNode.h"
+#include "query/ExecPlanNodeVisitor.h"
+#include "query/PlanProto.h"
+#include "segcore/SegmentSealed.h"
+#include "segcore/Types.h"
+#include "segcore/load_index_c.h"
 #include "storage/FileManager.h"
 #include "storage/InsertData.h"
 #include "storage/PayloadReader.h"
@@ -33,6 +45,7 @@
 #include "storage/Util.h"
 #include "test_utils/Constants.h"
 #include "test_utils/DataGen.h"
+#include "test_utils/GenExprProto.h"
 #include "test_utils/storage_test_utils.h"
 
 using namespace milvus;
@@ -129,10 +142,16 @@ TEST(FMIndex, EmptyPatternMatchesAllRows) {
 TEST(FMIndex, ShouldUseOpDeclinesRangeAndRegex) {
     auto idx = MakeRawDataIndex({"apple", "banana"});
 
+    // The allowlist mirrors UnaryIndexFunc's dispatch: these five ops resolve
+    // to In/NotIn/PatternMatch, all answered exactly.
+    EXPECT_TRUE(idx->ShouldUseOp(proto::plan::OpType::Equal));
+    EXPECT_TRUE(idx->ShouldUseOp(proto::plan::OpType::NotEqual));
     EXPECT_TRUE(idx->ShouldUseOp(proto::plan::OpType::PrefixMatch));
     EXPECT_TRUE(idx->ShouldUseOp(proto::plan::OpType::PostfixMatch));
     EXPECT_TRUE(idx->ShouldUseOp(proto::plan::OpType::InnerMatch));
 
+    // Everything else declines (falls back to the raw-data scan) — wrongly
+    // accepting would route into Range()/PatternMatch overloads that throw.
     EXPECT_FALSE(idx->ShouldUseOp(proto::plan::OpType::GreaterThan));
     EXPECT_FALSE(idx->ShouldUseOp(proto::plan::OpType::GreaterEqual));
     EXPECT_FALSE(idx->ShouldUseOp(proto::plan::OpType::LessThan));
@@ -142,6 +161,35 @@ TEST(FMIndex, ShouldUseOpDeclinesRangeAndRegex) {
 
     // And the ops it declines to route would indeed throw if reached directly.
     EXPECT_THROW(idx->Range("m", OpType::GreaterThan), SegcoreError);
+}
+
+// Library-level: a LoadView'd (zero-copy) index must answer doc queries with
+// nothing but the mapped bytes, and Extract — the only consumer of the lazily
+// built ISA table — must still work after the view-load (first call builds it).
+TEST(FMIndex, LibraryLoadViewZeroCopyAndLazyExtract) {
+    std::vector<std::string> data{"apple", "banana", "grape"};
+    std::vector<std::string_view> docs(data.begin(), data.end());
+    index::fmindex::FMIndex built;
+    built.Build(docs, /*sa_sample_rate=*/4);
+    std::string blob = built.Serialize();
+
+    // LoadView requires 8-byte alignment; std::string does not guarantee it.
+    std::vector<uint64_t> aligned((blob.size() + 7) / 8);
+    std::memcpy(aligned.data(), blob.data(), blob.size());
+    auto viewed = index::fmindex::FMIndex::LoadView(
+        reinterpret_cast<const uint8_t*>(aligned.data()), blob.size());
+    ASSERT_TRUE(viewed.valid());
+
+    auto p = [](const char* s) {
+        return reinterpret_cast<const uint8_t*>(s);
+    };
+    EXPECT_EQ(viewed.MatchingDocs(p("an"), 2), (std::vector<uint64_t>{1}));
+    EXPECT_EQ(viewed.CountPrefixDocs(p("gr"), 2), 1u);
+    // Extract triggers the lazy ISA build on the viewed index.
+    EXPECT_EQ(viewed.Extract(0, 0, 5), "apple");
+    EXPECT_EQ(viewed.Extract(1, 2, 4), "nana");
+    // Round-trip: re-serializing the viewed index reproduces the blob.
+    EXPECT_EQ(viewed.Serialize(), blob);
 }
 
 // InnerMatch over rows that each contain the pattern MANY times: the result is
@@ -383,4 +431,176 @@ TEST(FMIndex, NullVsEmptyStringDistinctAfterReload) {
               (std::vector<int64_t>{0, 1, 3}));
     EXPECT_EQ(SetBits(idx->PatternMatch("", proto::plan::OpType::PostfixMatch)),
               (std::vector<int64_t>{0, 1, 3}));
+}
+
+// ---- executor path: declined ops downgrade to the scan, accepted ops agree --
+
+// Run real filter expressions through ExecuteQueryExpr on a sealed segment that
+// has BOTH the raw VARCHAR column and a loaded FMINDEX. This pins the routing
+// contract at the execution layer, not just at ShouldUseOp's return value:
+//   - ops the index declines (range `>`/`<=`, general LIKE `a%e`) must
+//     transparently fall back to the raw-data scan — correct rows, NO throw;
+//   - ops it accepts (anchored LIKE, equality, `LIKE '%'` lowered to
+//     PrefixMatch("")) must return exactly the scan's rows.
+TEST(FMIndex, ExecutorPathDeclinedOpsFallBackToScan) {
+    int64_t collection_id = 1, partition_id = 2, segment_id = 3;
+    int64_t index_build_id = 6001, index_version = 6001, index_id = 7001;
+
+    auto schema = std::make_shared<Schema>();
+    auto field_id = schema->AddDebugField("fm_exec", DataType::VARCHAR);
+
+    auto field_meta = milvus::segcore::gen_field_meta(collection_id,
+                                                      partition_id,
+                                                      segment_id,
+                                                      field_id.get(),
+                                                      DataType::VARCHAR,
+                                                      DataType::NONE,
+                                                      false);
+    auto index_meta = gen_index_meta(
+        segment_id, field_id.get(), index_build_id, index_version);
+    auto storage_config = gen_local_storage_config(TestLocalPath);
+    auto cm = CreateChunkManager(storage_config);
+    auto fs = storage::InitArrowFileSystem(storage_config);
+
+    std::vector<std::string> data{
+        "apple", "banana", "grape", "melon", "zebra", "apse", "ane", ""};
+    const size_t nb = data.size();
+
+    auto field_data =
+        storage::CreateFieldData(DataType::VARCHAR, DataType::NONE, false);
+    field_data->FillFieldData(data.data(), data.size());
+
+    // Sealed segment with the raw column loaded (the scan path's data source).
+    auto segment = milvus::segcore::CreateSealedSegment(schema);
+    auto field_data_info = PrepareSingleFieldInsertBinlog(collection_id,
+                                                          partition_id,
+                                                          segment_id,
+                                                          field_id.get(),
+                                                          {field_data},
+                                                          cm);
+    segment->LoadFieldData(field_data_info);
+
+    // Binlog for the index build.
+    auto payload_reader =
+        std::make_shared<milvus::storage::PayloadReader>(field_data);
+    storage::InsertData insert_data(payload_reader);
+    insert_data.SetFieldDataMeta(field_meta);
+    insert_data.SetTimestamps(0, 100);
+    auto serialized_bytes = insert_data.Serialize(storage::Remote);
+    auto log_path = fmt::format("{}{}/{}/{}/{}/{}",
+                                TestLocalPath,
+                                collection_id,
+                                partition_id,
+                                segment_id,
+                                field_id.get(),
+                                1);
+    auto cm_w = ChunkManagerWrapper(cm);
+    cm_w.Write(log_path, serialized_bytes.data(), serialized_bytes.size());
+
+    storage::FileManagerContext ctx(field_meta, index_meta, cm, fs);
+    std::vector<std::string> index_files;
+    int64_t index_size = 0;
+    {
+        Config config;
+        config[milvus::index::INDEX_TYPE] = milvus::index::FMINDEX_INDEX_TYPE;
+        config[INSERT_FILES_KEY] = std::vector<std::string>{log_path};
+        index::FMIndexParams params{/*loading_index=*/false,
+                                    /*sa_sample_rate=*/8};
+        auto built = std::make_shared<index::FMIndex>(ctx, params);
+        built->Build(config);
+        auto stats = built->UploadUnified({});
+        index_size = stats->GetSerializedSize();
+        index_files = stats->GetIndexFiles();
+    }
+
+    // Load the index INTO the segment through the production entry point
+    // (AppendIndexV2 -> IndexFactory -> LoadUnified), so queries route through
+    // the real pinned-index path.
+    std::map<std::string, std::string> index_params{
+        {milvus::index::INDEX_TYPE, milvus::index::FMINDEX_INDEX_TYPE},
+        {milvus::index::FM_SA_SAMPLE_RATE, "8"},
+        {milvus::LOAD_PRIORITY, "HIGH"},
+        {milvus::index::SCALAR_INDEX_ENGINE_VERSION, "3"},
+    };
+    milvus::segcore::LoadIndexInfo load_index_info{};
+    load_index_info.collection_id = collection_id;
+    load_index_info.partition_id = partition_id;
+    load_index_info.segment_id = segment_id;
+    load_index_info.field_id = field_id.get();
+    load_index_info.field_type = DataType::VARCHAR;
+    load_index_info.enable_mmap = true;
+    load_index_info.mmap_dir_path = TestLocalPath + "mmap";
+    load_index_info.index_id = index_id;
+    load_index_info.index_build_id = index_build_id;
+    load_index_info.index_version = index_version;
+    load_index_info.index_params = index_params;
+    load_index_info.index_files = index_files;
+    load_index_info.schema = field_meta.field_schema;
+    load_index_info.index_size = index_size;
+    uint8_t trace_id[16] = {1};
+    uint8_t span_id[8] = {2};
+    CTraceContext trace{};
+    trace.traceID = trace_id;
+    trace.spanID = span_id;
+    trace.traceFlags = 0;
+    AppendIndexV2(trace, static_cast<CLoadIndexInfo>(&load_index_info));
+    segment->LoadIndex(load_index_info);
+
+    auto run = [&](proto::plan::OpType op, std::string value) {
+        auto* unary = test::GenUnaryRangeExpr(op, value);
+        unary->set_allocated_column_info(test::GenColumnInfo(
+            field_id.get(), proto::schema::DataType::VarChar, false, false));
+        auto expr = test::GenExpr();
+        expr->set_allocated_unary_range_expr(unary);
+        auto parser = milvus::query::ProtoParser(schema);
+        auto typed_expr = parser.ParseExprs(*expr);
+        auto node = std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID,
+                                                           typed_expr);
+        return milvus::query::ExecuteQueryExpr(
+            node, segment.get(), nb, MAX_TIMESTAMP);
+    };
+    auto expect_rows = [&](const BitsetType& got,
+                           const std::function<bool(const std::string&)>& oracle,
+                           const char* what) {
+        for (size_t i = 0; i < nb; i++) {
+            EXPECT_EQ(got[i], oracle(data[i]))
+                << what << " row " << i << " (" << data[i] << ")";
+        }
+    };
+
+    // DECLINED: lexicographic range — must scan, not throw.
+    expect_rows(
+        run(proto::plan::OpType::GreaterThan, "m"),
+        [](const std::string& s) { return s > "m"; },
+        "GreaterThan");
+    expect_rows(
+        run(proto::plan::OpType::LessEqual, "banana"),
+        [](const std::string& s) { return s <= "banana"; },
+        "LessEqual");
+    // DECLINED: general LIKE 'a%e' (interior wildcard -> Match) — regex scan.
+    expect_rows(
+        run(proto::plan::OpType::Match, "a%e"),
+        [](const std::string& s) {
+            return !s.empty() && s.front() == 'a' && s.back() == 'e';
+        },
+        "Match a%e");
+    // ACCEPTED: anchored ops answered by the index, must equal the scan.
+    expect_rows(
+        run(proto::plan::OpType::InnerMatch, "an"),
+        [](const std::string& s) { return s.find("an") != std::string::npos; },
+        "InnerMatch an");
+    expect_rows(
+        run(proto::plan::OpType::PrefixMatch, "ap"),
+        [](const std::string& s) { return s.rfind("ap", 0) == 0; },
+        "PrefixMatch ap");
+    expect_rows(
+        run(proto::plan::OpType::Equal, "banana"),
+        [](const std::string& s) { return s == "banana"; },
+        "Equal banana");
+    // ACCEPTED: `LIKE '%'` lowers to PrefixMatch("") — all rows (no nulls here),
+    // the empty-pattern fix exercised end-to-end.
+    expect_rows(
+        run(proto::plan::OpType::PrefixMatch, ""),
+        [](const std::string&) { return true; },
+        "PrefixMatch empty");
 }

@@ -4,6 +4,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -286,14 +288,21 @@ class FMIndex {
     // ends with the pattern. Shared by CountSuffixDocs / LocateSuffixDocs.
     std::pair<size_t, size_t>
     suffixDocInterval(const uint8_t* pattern, size_t plen) const;
-    // Rebuild the in-RAM-only structures derived from the serialized fields:
-    // id_to_byte_ (from byte_to_id_) and isa_sample_ (from sampled_bv_ +
-    // sa_sample_vals_). Called after Build and after a load.
+    // Rebuild the (small) in-RAM-only structures derived from the serialized
+    // fields: id_to_byte_ (from byte_to_id_). Called after Build and after a
+    // load. isa_sample_ is NOT built here — see ensureIsaSample().
     void
     buildDerived();
-    // Fill *this by viewing serialized bytes at base; the wavelet/sampled word
-    // arrays are viewed, the small sample/doc arrays are copied. Returns false
-    // on a truncated/corrupt/incompatible blob.
+    // Build isa_sample_ on first use (Extract is its only consumer). Thread-safe
+    // (std::call_once); costs one O(m) pass + m/rate x 8 B of heap, paid only by
+    // workloads that actually Extract.
+    void
+    ensureIsaSample() const;
+    // Fill *this by viewing serialized bytes at base: the wavelet/sampled word
+    // arrays, the sampled-SA values AND the doc boundaries are all viewed in
+    // place (validated read-only, never copied) — the only heap rebuilt on load
+    // is the rank directories. Returns false on a truncated/corrupt/
+    // incompatible blob.
     bool
     parseView(const uint8_t* base, size_t size);
     // Append the fixed header (everything before the aligned payload arrays).
@@ -316,21 +325,48 @@ class FMIndex {
     std::vector<size_t>
         first_;             // per-symbol map_zero (derived, not serialized)
     BitVector sampled_bv_;  // row is SA-sampled? rank = sample index
-    // SA values of sampled rows, in row order. Held as uint64 in RAM; serialized
-    // at 4 bytes when len < 2^32, else 8 (so small corpora keep the small index).
-    std::vector<uint64_t> sa_sample_vals_;
+
+    // SA values of sampled rows, in row order — serialized at 4 bytes when
+    // len < 2^32 (narrow), else 8 (wide). Build owns them in sample_vals_owned_
+    // (wide in RAM); a load VIEWS them straight from the (mmap'd or owned) blob
+    // in whichever width they were stored — no heap copy, no widening pass.
+    // Exactly one of sv_wide_ / sv_narrow_ is set on a valid index; all access
+    // goes through sample_val(). At the default sample rate these arrays are of
+    // the same order as the whole blob, so copying them on load would defeat
+    // mmap's memory story.
+    std::vector<uint64_t> sample_vals_owned_;  // Build-mode storage only
+    const uint64_t* sv_wide_ = nullptr;
+    const uint32_t* sv_narrow_ = nullptr;
+    size_t n_samples_ = 0;
+
+    uint64_t
+    sample_val(size_t i) const {
+        return sv_narrow_ != nullptr ? static_cast<uint64_t>(sv_narrow_[i])
+                                     : sv_wide_[i];
+    }
+
     // Internal document boundaries (offsets into the separator-injected buffer),
-    // size n_docs+1: doc_start_[d] = internal start of doc d, doc_start_[n_docs]
-    // = text_len_. Doc d's content is [doc_start_[d], doc_start_[d+1]-1) with the
-    // separator symbol at doc_start_[d+1]-1.
-    std::vector<uint64_t> doc_start_;
+    // n_doc_bounds_ == n_docs+1 entries: doc_start_[d] = internal start of doc
+    // d, doc_start_[n_docs] = text_len_. Doc d's content is [doc_start_[d],
+    // doc_start_[d+1]-1) with the separator symbol at doc_start_[d+1]-1.
+    // Same ownership scheme as the samples: Build owns doc_bounds_owned_, a
+    // load views the 8-byte-aligned array in the blob directly.
+    std::vector<uint64_t> doc_bounds_owned_;  // Build-mode storage only
+    const uint64_t* doc_start_ = nullptr;
+    size_t n_doc_bounds_ = 0;
+
     int32_t sep_id_ =
         1;  // dense id of the separator symbol (constant; not a byte)
     // Derived, in-RAM only (rebuilt on load, never serialized):
     std::vector<uint8_t>
         id_to_byte_;  // dense id -> byte (inverse of byte_to_id_)
-    std::vector<uint64_t>
-        isa_sample_;  // isa_sample_[k] = row whose SA value = k*rate
+    // isa_sample_[k] = row whose SA value = k*rate. Only Extract needs it, and
+    // building it walks ALL m rows (an O(m) pass + m/rate x 8 B of heap) — so it
+    // is built LAZILY on the first Extract call (thread-safe via isa_once_),
+    // never at load time. Locate/Count/prefix/suffix never touch it.
+    mutable std::vector<uint64_t> isa_sample_;
+    mutable std::unique_ptr<std::once_flag> isa_once_ =
+        std::make_unique<std::once_flag>();
     std::vector<uint8_t>
         owned_blob_;  // backs the views when Deserialized by copy
 };

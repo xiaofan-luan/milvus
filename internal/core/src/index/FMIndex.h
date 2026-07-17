@@ -155,33 +155,29 @@ class FMIndex : public ScalarIndex<std::string> {
         return true;
     }
 
-    // Only the exact anchored/substring pattern ops can be answered exactly
-    // (no recheck) by the FM-index. General LIKE / regex / range fall back to
-    // the raw-data scan.
+    // Routing gate for the executor (UnaryIndexFunc via CanUseIndexForOp).
+    // ALLOWLIST with a false default: declining an op merely downgrades to the
+    // raw-data scan (correct, just slower), while wrongly accepting one routes
+    // it into a method that throws (Range() is Unsupported; PatternMatch
+    // rejects Match/RegexMatch) and FAILS the query. So the safe default for
+    // any op not explicitly supported — including ops added to the enum in the
+    // future — is false. The allowlist mirrors UnaryIndexFunc's dispatch:
+    // Equal -> In, NotEqual -> NotIn, and the three anchored pattern ops ->
+    // PatternMatch, all of which this index answers exactly.
     bool
     ShouldUseOp(proto::plan::OpType op) const override {
         switch (op) {
+            case proto::plan::OpType::Equal:
+            case proto::plan::OpType::NotEqual:
             case proto::plan::OpType::PrefixMatch:
             case proto::plan::OpType::PostfixMatch:
             case proto::plan::OpType::InnerMatch:
                 return true;
-            // General LIKE / regex are not answered exactly in v1; decline so
-            // the executor runs the brute-force scan path.
-            case proto::plan::OpType::Match:
-            case proto::plan::OpType::RegexMatch:
-            // Lexicographic range needs forward navigation the FM-index does
-            // not carry (Range() throws Unsupported). Decline so the executor
-            // downgrades to the raw-data scan (UnaryIndexFunc otherwise calls
-            // index->Range() directly for these ops). Without this, the base
-            // ShouldUseOp default returns true for range and the query throws
-            // instead of scanning.
-            case proto::plan::OpType::GreaterThan:
-            case proto::plan::OpType::GreaterEqual:
-            case proto::plan::OpType::LessThan:
-            case proto::plan::OpType::LessEqual:
-                return false;
+            // Notable declines: general LIKE (Match) / RegexMatch are not
+            // answered exactly in v1; lexicographic range (GT/GE/LT/LE) needs
+            // forward navigation the FM-index does not carry.
             default:
-                return true;
+                return false;
         }
     }
 

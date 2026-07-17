@@ -443,10 +443,20 @@ All integration points verified against master (branch state of 2026-07-14).
   path, `ScalarIndex.h:242-259`) writing the library's flat blob
   (`SerializeToFile` streams; header + 8-byte-aligned payload sections).
 - **mmap**: the blob is designed for `LoadView(base, size)` zero-copy — quad
-  wavelet words and sampled bitmaps are viewed in place; only rank directories
-  and small arrays are rebuilt in RAM (measured: warm-mmap throughput equals
-  in-RAM). Load validation is hardened (structural checks; corrupted-payload
-  integrity remains the storage checksum's job, as for all indexes).
+  wavelet words, sampled bitmaps, sampled-SA values AND doc boundaries are all
+  viewed in place (the samples through a narrow/wide-aware accessor, so the
+  compact 4-byte on-disk form is served directly); the ISA table (Extract's
+  anchor) is built lazily on first `Extract`, which no Milvus query op calls.
+  What a load DOES rebuild in RAM is the rank directories, ~the size of the
+  wavelet section itself — so mmap-resident memory is bounded by (and in
+  practice well under) the blob size, which is what the load-resource
+  estimator reports. Load validation is hardened (structural checks over the
+  views, allocation-free; corrupted-payload integrity remains the storage
+  checksum's job, as for all indexes). *Open item (format v4, pre-GA only):*
+  serialize the rank directories too and view them, making LoadView fully
+  zero-copy and dropping the O(m) directory-build pass at load — requires a
+  clamp-on-read (or verify-on-load) design so a corrupted directory stays
+  memory-safe.
 - **Caching layer**: standard pinning (`PinWrapper`) as with NGRAM; concurrent
   reads are lock-free by construction (all query methods `const`, TSan-verified).
 
