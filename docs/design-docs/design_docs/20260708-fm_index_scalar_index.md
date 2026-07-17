@@ -302,7 +302,7 @@ would lose to a scan:
 - Scan cost ≈ segment text bytes (sequential) — proportional to the **total
   tokens (bytes)**, *not* to the row count.
 - Guard: accelerate iff `occ × sa_sample_rate < active_tokens ×
-  queryNode.fmindexCostRatio` (config, **default 0.002**). Normalizing by
+  queryNode.fmindexCostRatio` (config, **default 0.001**). Normalizing by
   tokens, not rows, makes the threshold **invariant to row length** (below).
   Degenerate patterns (`'%a%'`) fail immediately and scan, avoiding the cliff.
 
@@ -321,7 +321,12 @@ FM-index benchmark, `sa_sample_rate = 8`), sweeping two axes:
   length — but as `occ / total_tokens` it is **stable** (~0.0003 at both 30-byte
   and 10 KB rows). Hence the token normalization: `fmindexCostRatio` is the
   (row-length- and sample-rate-independent) sequential-scan-per-token vs.
-  random-LF-step cost ratio, measured ~0.002. A fixed `occ / rows` ratio would
+  random-LF-step cost ratio — measured ~0.002 on short/repetitive rows and
+  ~0.0008 on a cache-adversarial corpus (1 GiB of per-row random text, where
+  the BWT has no runs and every LF step misses cache while the scan's memchr
+  fast-path streams at ~7 GB/s), hence the conservative 0.001 default: the
+  guard must never make the index SLOWER than the scan it replaces. A fixed
+  `occ / rows` ratio would
   wrongly decline FM on long-row (`TEXT`/long `VARCHAR`) columns.
 
 Pattern length is second-order: the count is `O(|P|)` and near-free (**~0.1 µs**,
@@ -549,7 +554,7 @@ Future work enabled by capabilities already in the library:
 |---|---|---|---|
 | `fm_sa_sample_rate` | 8 | [4, 256] | SA sampling: space vs. locate latency. No effect on `Count`. Default 8 is locate-tuned (~7-10× faster locate than 32, ~30% larger index); raise to 64+ for count-only workloads |
 | `mmap.enabled` | collection/field setting | — | zero-copy view load |
-| `queryNode.fmindexCostRatio` (config, not index param) — **PR-2, not wired in this PR** | 0.002 | (0, 1] | guard: brute-scan instead of enumerate when `occ × sa_sample_rate ≥ active_tokens × this`. Normalized by tokens (bytes), **not rows**, so it is row-length invariant. Default 0.002 = the sequential-scan-per-token / random-LF-step cost ratio, from the PR-2 sweep |
+| `queryNode.fmindexCostRatio` (config, not index param) — **PR-2, not wired in this PR** | 0.001 | (0, 1] | guard: brute-scan instead of enumerate when `occ × sa_sample_rate ≥ active_tokens × this`. Normalized by tokens (bytes), **not rows**, so it is row-length invariant. Measured crossover: ~0.002 (repetitive/short rows) down to ~0.0008 (random text, cache-adversarial for LF walks) — default 0.001 takes the conservative end |
 
 Reserved for future: `case_insensitive` (see above).
 
@@ -626,7 +631,9 @@ Index params validated at creation; unknown params rejected by the checker.
    (recommended), or keep parallel FMINDEX-specific expr paths.
 3. **Guard default (PR-2)** — the guard normalizes by **tokens, not rows**
    (`occ × sa_sample_rate < active_tokens × fmindexCostRatio`), default
-   `fmindexCostRatio = 0.002`, from a throwaway FM-index benchmark sweep.
+   `fmindexCostRatio = 0.001`, from FM-index benchmark sweeps (crossover
+   measured ~0.002 on repetitive/short rows, ~0.0008 on 1 GiB per-row random
+   text — the conservative end wins: never slower than the scan).
    Rationale: the `occ / rows` crossover scales with row length (~1.2 % at
    30-byte rows, >100 % at 10 KB rows where FM beats a scan ~900× even at 1 %
    match), while `occ / total_tokens` is stable (~0.0003) — a fixed row-ratio
