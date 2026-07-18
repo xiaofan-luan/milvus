@@ -18,7 +18,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -41,6 +43,128 @@
 using namespace milvus;
 using namespace milvus::segcore;
 using namespace milvus::segcore::storagev2translator;
+
+namespace {
+
+// Records each data read (get_chunk / get_chunks) with the column set the
+// issuing ChunkReader was projected to, so tests can assert IO behaviour:
+// how many reads happened and which columns each read covered.
+struct ReadLog {
+    std::mutex mu;
+    std::vector<std::vector<std::string>> reads;
+    void
+    Record(const std::vector<std::string>& cols) {
+        std::lock_guard<std::mutex> lk(mu);
+        reads.push_back(cols);
+    }
+    void
+    Clear() {
+        std::lock_guard<std::mutex> lk(mu);
+        reads.clear();
+    }
+    size_t
+    Count() {
+        std::lock_guard<std::mutex> lk(mu);
+        return reads.size();
+    }
+};
+
+// Wraps a real ChunkReader; logs its projection on every data read.
+class CountingChunkReader : public milvus_storage::api::ChunkReader {
+ public:
+    CountingChunkReader(std::unique_ptr<milvus_storage::api::ChunkReader> inner,
+                        std::vector<std::string> columns,
+                        std::shared_ptr<ReadLog> log)
+        : inner_(std::move(inner)),
+          columns_(std::move(columns)),
+          log_(std::move(log)) {
+    }
+    size_t
+    total_number_of_chunks() const override {
+        return inner_->total_number_of_chunks();
+    }
+    arrow::Result<std::vector<int64_t>>
+    get_chunk_indices(const std::vector<int64_t>& row_indices) override {
+        return inner_->get_chunk_indices(row_indices);
+    }
+    arrow::Result<std::shared_ptr<arrow::RecordBatch>>
+    get_chunk(int64_t chunk_index) override {
+        log_->Record(columns_);
+        return inner_->get_chunk(chunk_index);
+    }
+    arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>>
+    get_chunks(const std::vector<int64_t>& chunk_indices,
+               size_t parallelism = 1) override {
+        log_->Record(columns_);
+        return inner_->get_chunks(chunk_indices, parallelism);
+    }
+    arrow::Result<std::vector<uint64_t>>
+    get_chunk_size() override {
+        return inner_->get_chunk_size();
+    }
+    arrow::Result<std::vector<uint64_t>>
+    get_chunk_rows() override {
+        return inner_->get_chunk_rows();
+    }
+
+ private:
+    std::unique_ptr<milvus_storage::api::ChunkReader> inner_;
+    std::vector<std::string> columns_;
+    std::shared_ptr<ReadLog> log_;
+};
+
+// Wraps a real Reader; hands out CountingChunkReaders tagged with their
+// projection. Metadata calls (get_chunk_size/rows) are NOT logged, so the log
+// reflects only actual data reads.
+class CountingReader : public milvus_storage::api::Reader {
+ public:
+    CountingReader(std::shared_ptr<milvus_storage::api::Reader> inner,
+                   std::shared_ptr<ReadLog> log)
+        : inner_(std::move(inner)), log_(std::move(log)) {
+    }
+    std::shared_ptr<milvus_storage::api::ColumnGroups>
+    get_column_groups() const override {
+        return inner_->get_column_groups();
+    }
+    arrow::Result<std::shared_ptr<arrow::RecordBatchReader>>
+    get_record_batch_reader(const std::string& predicate) const override {
+        return inner_->get_record_batch_reader(predicate);
+    }
+    arrow::Result<std::unique_ptr<milvus_storage::api::ChunkReader>>
+    get_chunk_reader(int64_t column_group_index,
+                     const std::shared_ptr<std::vector<std::string>>&
+                         needed_columns) const override {
+        auto result = inner_->get_chunk_reader(column_group_index,
+                                               needed_columns);
+        if (!result.ok()) {
+            return result.status();
+        }
+        std::vector<std::string> cols =
+            needed_columns ? *needed_columns : std::vector<std::string>{};
+        return std::unique_ptr<milvus_storage::api::ChunkReader>(
+            new CountingChunkReader(
+                std::move(result).ValueOrDie(), std::move(cols), log_));
+    }
+    arrow::Result<std::shared_ptr<arrow::Table>>
+    take(const std::vector<int64_t>& row_indices,
+         size_t parallelism,
+         const std::shared_ptr<std::vector<std::string>>& needed_columns)
+        override {
+        return inner_->take(row_indices, parallelism, needed_columns);
+    }
+    void
+    set_keyretriever(
+        const std::function<std::string(const std::string&)>& callback)
+        override {
+        inner_->set_keyretriever(callback);
+    }
+
+ private:
+    std::shared_ptr<milvus_storage::api::Reader> inner_;
+    std::shared_ptr<ReadLog> log_;
+};
+
+}  // namespace
 
 class ManifestGroupTranslatorTest : public ::testing::TestWithParam<bool> {
     void
@@ -398,6 +522,89 @@ TEST_P(ManifestGroupTranslatorTest, TestPerFieldCells) {
         EXPECT_NE(chunk->GetChunk(expected_fid), nullptr)
             << "cid=" << cid << " missing field " << expected_fid.get();
     }
+}
+
+// Verify the IO shape of get_cells via a counting Reader:
+//   (a) multiple fields of the same chunk are read in ONE coalesced IO;
+//   (b) a single field reads only that field's column;
+//   (c) warmup (all fields, all chunks) coalesces per chunk — every read
+//       covers all fields, never a single field, and the read count is far
+//       below the un-coalesced fields*chunks.
+TEST_P(ManifestGroupTranslatorTest, TestCoalescedReadIO) {
+    auto use_mmap = GetParam();
+    auto log = std::make_shared<ReadLog>();
+    auto reader =
+        std::make_shared<CountingReader>(test_data_->CreateReader(), log);
+    auto field_columns = test_data_->GetFieldColumns(0);
+    auto field_metas = test_data_->GetFieldMetas(0);
+    ASSERT_GE(field_columns.size(), 2u)
+        << "need a multi-field column group for coalescing";
+
+    auto translator = std::make_unique<ManifestGroupTranslator>(
+        segment_id_,
+        GroupChunkType::DEFAULT,
+        /*column_group_index=*/0,
+        /*reader_cg_index=*/0,
+        reader,
+        field_columns,
+        field_metas,
+        use_mmap,
+        /*mmap_populate=*/true,
+        mmap_dir_,
+        milvus::proto::common::LoadPriority::LOW,
+        /*eager_load=*/true,
+        /*warmup_policy=*/"");
+    auto meta = static_cast<GroupCTMeta*>(translator->meta());
+    ASSERT_GT(meta->num_chunks_, 0u);
+    // Construction probes per-field sizes via get_chunk_size (metadata, not
+    // logged), so no data read has happened yet.
+    ASSERT_EQ(log->Count(), 0u);
+
+    // (a) Two fields of chunk 0 => ONE read covering both columns.
+    log->Clear();
+    std::vector<cachinglayer::cid_t> multi = {
+        static_cast<cachinglayer::cid_t>(meta->cid_of(0, 0)),
+        static_cast<cachinglayer::cid_t>(meta->cid_of(1, 0)),
+    };
+    auto cells_a = translator->get_cells(nullptr, multi);
+    ASSERT_EQ(cells_a.size(), 2u);
+    EXPECT_EQ(log->reads.size(), 1u)
+        << "two fields of one chunk should be a single coalesced read";
+    if (!log->reads.empty()) {
+        EXPECT_EQ(log->reads[0].size(), 2u)
+            << "the coalesced read should project both columns";
+    }
+
+    // (b) One field of chunk 0 => ONE read of only that column.
+    log->Clear();
+    auto cells_b = translator->get_cells(
+        nullptr,
+        {static_cast<cachinglayer::cid_t>(meta->cid_of(0, 0))});
+    ASSERT_EQ(cells_b.size(), 1u);
+    EXPECT_EQ(log->reads.size(), 1u);
+    if (!log->reads.empty()) {
+        EXPECT_EQ(log->reads[0].size(), 1u)
+            << "single-field read must project only that column";
+    }
+
+    // (c) Warmup: all fields of all chunks. Every read covers all fields
+    // (coalesced per chunk); read count is at most num_chunks (IO-merge may
+    // reduce it further) and far below fields*chunks.
+    log->Clear();
+    std::vector<cachinglayer::cid_t> all;
+    all.reserve(translator->num_cells());
+    for (size_t i = 0; i < translator->num_cells(); ++i) {
+        all.push_back(static_cast<cachinglayer::cid_t>(i));
+    }
+    auto cells_c = translator->get_cells(nullptr, all);
+    ASSERT_EQ(cells_c.size(), translator->num_cells());
+    ASSERT_GT(log->reads.size(), 0u);
+    for (const auto& r : log->reads) {
+        EXPECT_EQ(r.size(), field_columns.size())
+            << "warmup read must cover all fields (coalesced), not one field";
+    }
+    EXPECT_LE(log->reads.size(), meta->num_chunks_)
+        << "coalesced warmup must not do fields*chunks reads";
 }
 
 INSTANTIATE_TEST_SUITE_P(ManifestGroupTranslator,
