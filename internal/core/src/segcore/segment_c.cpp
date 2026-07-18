@@ -455,6 +455,13 @@ AsyncSearch(CTraceContext c_trace,
 
             milvus::OpContext op_ctx(cancel_token);
             segment->LazyCheckSchema(plan->schema_, &op_ctx);
+            // Coalesced-read hint: this operation reads exactly the plan's
+            // access_entries_; storage-v3 per-field reads use it to co-load
+            // sibling fields of the same column group in one IO.
+            op_ctx.coload_fields.reserve(plan->access_entries_.size());
+            for (auto _coload_fid : plan->access_entries_) {
+                op_ctx.coload_fields.push_back(_coload_fid.get());
+            }
             auto internal_segment =
                 static_cast<milvus::segcore::SegmentInternalInterface*>(
                     segment);
@@ -562,6 +569,13 @@ AsyncRetrieve(CTraceContext c_trace,
 
             milvus::OpContext op_ctx(cancel_token);
             segment->LazyCheckSchema(plan->schema_, &op_ctx);
+            // Coalesced-read hint: this operation reads exactly the plan's
+            // access_entries_; storage-v3 per-field reads use it to co-load
+            // sibling fields of the same column group in one IO.
+            op_ctx.coload_fields.reserve(plan->access_entries_.size());
+            for (auto _coload_fid : plan->access_entries_) {
+                op_ctx.coload_fields.push_back(_coload_fid.get());
+            }
             auto internal_segment =
                 static_cast<milvus::segcore::SegmentInternalInterface*>(
                     segment);
@@ -607,6 +621,13 @@ AsyncRetrieveByOffsets(CTraceContext c_trace,
 
             milvus::OpContext op_ctx(cancel_token);
             segment->LazyCheckSchema(plan->schema_, &op_ctx);
+            // Coalesced-read hint: this operation reads exactly the plan's
+            // access_entries_; storage-v3 per-field reads use it to co-load
+            // sibling fields of the same column group in one IO.
+            op_ctx.coload_fields.reserve(plan->access_entries_.size());
+            for (auto _coload_fid : plan->access_entries_) {
+                op_ctx.coload_fields.push_back(_coload_fid.get());
+            }
             auto internal_segment =
                 static_cast<milvus::segcore::SegmentInternalInterface*>(
                     segment);

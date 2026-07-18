@@ -221,6 +221,30 @@ class V3SegmentTestData {
         return result;
     }
 
+    // A Reader over all column groups (index == cg_index), for the per-field
+    // ManifestGroupTranslator which projects the Reader per field itself.
+    std::shared_ptr<milvus_storage::api::Reader>
+    CreateReader() const {
+        milvus_storage::api::Properties reader_props;
+        milvus_storage::api::SetValue(
+            reader_props, PROPERTY_FS_STORAGE_TYPE, LOON_FS_TYPE_LOCAL);
+        milvus_storage::api::SetValue(
+            reader_props, PROPERTY_FS_ROOT_PATH, root_path_.c_str());
+        return milvus_storage::api::Reader::create(
+            column_groups_, loon_schema_, nullptr, reader_props);
+    }
+
+    // (FieldId, storage_column_name) pairs for a column group, in column order.
+    std::vector<std::pair<FieldId, std::string>>
+    GetFieldColumns(int64_t cg_index) const {
+        std::vector<std::pair<FieldId, std::string>> result;
+        const auto& cg = column_groups_->at(cg_index);
+        for (const auto& col_name : cg->columns) {
+            result.emplace_back(FieldId(std::stoll(col_name)), col_name);
+        }
+        return result;
+    }
+
     std::unordered_map<FieldId, FieldMeta>
     GetAllFieldMetas() const {
         return schema_->get_fields();

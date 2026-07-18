@@ -20,6 +20,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -65,16 +67,27 @@ class ManifestGroupTranslator
      * @param num_fields Total number of fields in the column group
      * @param load_priority Priority level for loading operations
      */
+    // field_columns: the group's fields in field_index order, each paired with
+    // its storage column name (used to project the milvus-storage Reader down
+    // to a single field / a field subset). Cache cells are (field, chunk):
+    // reading one field never co-loads sibling fields.
+    // column_group_index: identifies this group for the cache key / mmap path.
+    // reader_cg_index: the column-group index to pass to reader->get_chunk_reader
+    //   (i.e. the group's position *within `reader`*). Usually equal to
+    //   column_group_index, but differs when the Reader was created for a
+    //   single column group (e.g. JSON-key-stats builds a fresh one-group
+    //   Reader whose index is 0 while column_group_index is the segment id).
     ManifestGroupTranslator(
         int64_t segment_id,
         GroupChunkType group_chunk_type,
         int64_t column_group_index,
-        std::shared_ptr<milvus_storage::api::ChunkReader> chunk_reader,
+        int64_t reader_cg_index,
+        std::shared_ptr<milvus_storage::api::Reader> reader,
+        std::vector<std::pair<FieldId, std::string>> field_columns,
         const std::unordered_map<FieldId, FieldMeta>& field_metas,
         bool use_mmap,
         bool mmap_populate,
         const std::string& mmap_dir_path,
-        int64_t num_fields,
         milvus::proto::common::LoadPriority load_priority,
         bool eager_load,
         const std::string& warmup_policy,
@@ -172,33 +185,65 @@ class ManifestGroupTranslator
 
  private:
     /**
-     * @brief Load a cell from multiple Arrow Tables
+     * @brief Build a GroupChunk from Arrow Tables.
      *
-     * Converts multiple Arrow Tables (from row groups) into a single
-     * GroupChunk containing merged field data for all columns.
+     * The tables come from a projected read (one or more columns). When
+     * only_field is set, only that field's column is materialized into a
+     * single-field GroupChunk (used by the coalesced read to split one
+     * multi-column read into per-(field,chunk) cells); otherwise all columns
+     * in the tables are materialized.
      *
      * @param tables Arrow Tables from row groups
-     * @param cid Cell ID of the chunk being loaded
+     * @param cid Cell ID (drives the mmap file name)
+     * @param only_field if set, materialize only this field
      * @return GroupChunk containing the loaded field data
      */
     std::unique_ptr<milvus::GroupChunk>
     load_group_chunk(const std::vector<std::shared_ptr<arrow::Table>>& tables,
-                     milvus::cachinglayer::cid_t cid);
+                     milvus::cachinglayer::cid_t cid,
+                     std::optional<FieldId> only_field = std::nullopt);
 
+    // Loading transient overhead for one (field, chunk) cell. Array fields
+    // need ~2x the cell size during reconstruction; other fields ~1x.
     int64_t
-    loading_overhead_bytes(int64_t cell_size) const;
+    loading_overhead_bytes(size_t field_index, int64_t cell_size) const;
+
+    // Get (build + cache) a ChunkReader projected to a single field. Reused
+    // for both size probing (construction) and single-field cell loads.
+    std::shared_ptr<milvus_storage::api::ChunkReader>
+    field_chunk_reader(size_t field_index);
+
+    // Get (build + cache) a ChunkReader projected to a sorted set of field
+    // indices, so a coalesced read pulls all of them in one IO. Thread-safe.
+    std::shared_ptr<milvus_storage::api::ChunkReader>
+    subset_chunk_reader(const std::vector<size_t>& sorted_field_indices);
 
     int64_t segment_id_;
     GroupChunkType group_chunk_type_;
     int64_t column_group_index_;
+    // Column-group index within `reader_` for get_chunk_reader (see ctor doc).
+    int64_t reader_cg_index_;
     std::string key_;
     std::unordered_map<FieldId, FieldMeta> field_metas_;
-    std::shared_ptr<milvus_storage::api::ChunkReader> chunk_reader_;
+    // The group Reader; ChunkReaders are projected from it per field/subset.
+    std::shared_ptr<milvus_storage::api::Reader> reader_;
+    // field_index -> FieldId, in a stable order shared with the cid encoding.
+    std::vector<FieldId> field_order_;
+    // field_index -> storage column name (for Reader projection).
+    std::vector<std::string> field_storage_columns_;
+    // Cache of per-field single-column ChunkReaders (built lazily / at ctor).
+    std::vector<std::shared_ptr<milvus_storage::api::ChunkReader>>
+        field_readers_;
+    // Cache of subset-projected ChunkReaders, keyed by the sorted field-index
+    // list joined by ','. Built on demand by get_cells (concurrent), guarded.
+    std::mutex subset_readers_mu_;
+    std::unordered_map<std::string,
+                       std::shared_ptr<milvus_storage::api::ChunkReader>>
+        subset_readers_;
 
     GroupCTMeta meta_;
     bool use_mmap_;
     bool mmap_populate_;
-    bool has_array_field_{false};
     std::string mmap_dir_path_;
     milvus::proto::common::LoadPriority load_priority_{
         milvus::proto::common::LoadPriority::HIGH};

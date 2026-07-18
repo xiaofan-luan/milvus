@@ -1151,30 +1151,30 @@ JsonKeyStats::LoadColumnGroup(int64_t column_group_id,
     if (eager_load) {
         auto needed_columns =
             std::make_shared<std::vector<std::string>>(column_names);
-        auto reader = milvus_storage::api::Reader::create(
-            column_groups, nullptr, needed_columns, properties);
-        auto chunk_reader_result = reader->get_chunk_reader(0, needed_columns);
-        AssertInfo(chunk_reader_result.ok(),
-                   "[JsonStats] failed to create chunk reader for column group "
-                   "{} segment {}: {}",
-                   column_group_id,
-                   segment_id_,
-                   chunk_reader_result.status().ToString());
-        auto chunk_reader_unique = std::move(chunk_reader_result).ValueOrDie();
-        std::shared_ptr<milvus_storage::api::ChunkReader> chunk_reader(
-            std::move(chunk_reader_unique));
+        std::shared_ptr<milvus_storage::api::Reader> reader =
+            milvus_storage::api::Reader::create(
+                column_groups, nullptr, needed_columns, properties);
+        // (inner_field_id, storage_column_name) pairs, index-aligned. The
+        // translator projects `reader` per field and builds (field, chunk)
+        // cells, so touching one JSON path loads only its shredding column.
+        std::vector<std::pair<FieldId, std::string>> field_columns;
+        field_columns.reserve(milvus_field_ids.size());
+        for (size_t i = 0; i < milvus_field_ids.size(); ++i) {
+            field_columns.emplace_back(milvus_field_ids[i], column_names[i]);
+        }
 
         auto translator = std::make_unique<
             milvus::segcore::storagev2translator::ManifestGroupTranslator>(
             segment_id_,
             GroupChunkType::JSON_KEY_STATS,
             column_group_id,
-            std::move(chunk_reader),
+            /*reader_cg_index=*/0,
+            reader,
+            std::move(field_columns),
             field_meta_map,
             enable_mmap,
             mmap_config.GetMmapPopulate(),
             mmap_filepath_,
-            milvus_field_ids.size(),
             load_priority_,
             /*eager_load=*/true,
             warmup_policy,
@@ -1208,41 +1208,32 @@ JsonKeyStats::LoadColumnGroup(int64_t column_group_id,
     // same as lazy storage-v2 column-group entries. This avoids co-loading
     // sibling JSON paths when a query touches only one shredding column.
     auto all_columns = std::make_shared<std::vector<std::string>>(column_names);
-    auto reader = milvus_storage::api::Reader::create(
-        column_groups, nullptr, all_columns, properties);
+    std::shared_ptr<milvus_storage::api::Reader> reader =
+        milvus_storage::api::Reader::create(
+            column_groups, nullptr, all_columns, properties);
     for (size_t i = 0; i < milvus_field_ids.size(); ++i) {
         const auto& inner_field_id = milvus_field_ids[i];
         const auto& column_name = column_names[i];
-        auto needed_columns =
-            std::make_shared<std::vector<std::string>>(std::vector<std::string>{
-                column_name,
-            });
-        auto chunk_reader_result = reader->get_chunk_reader(0, needed_columns);
-        AssertInfo(chunk_reader_result.ok(),
-                   "[JsonStats] failed to create projected chunk reader for "
-                   "column group {} column {} segment {}: {}",
-                   column_group_id,
-                   column_name,
-                   segment_id_,
-                   chunk_reader_result.status().ToString());
-        auto chunk_reader_unique = std::move(chunk_reader_result).ValueOrDie();
-        std::shared_ptr<milvus_storage::api::ChunkReader> chunk_reader(
-            std::move(chunk_reader_unique));
 
         auto field_meta = field_meta_map.at(inner_field_id);
         std::unordered_map<FieldId, FieldMeta> projected_field_meta_map;
         projected_field_meta_map.emplace(inner_field_id, field_meta);
+        // Single (field, column) — the translator projects `reader` to just
+        // this shredding column.
+        std::vector<std::pair<FieldId, std::string>> field_columns{
+            {inner_field_id, column_name}};
         auto translator = std::make_unique<
             milvus::segcore::storagev2translator::ManifestGroupTranslator>(
             segment_id_,
             GroupChunkType::JSON_KEY_STATS,
             column_group_id,
-            std::move(chunk_reader),
+            /*reader_cg_index=*/0,
+            reader,
+            std::move(field_columns),
             projected_field_meta_map,
             enable_mmap,
             mmap_config.GetMmapPopulate(),
             mmap_filepath_,
-            /*num_fields=*/1,
             load_priority_,
             eager_load,
             warmup_policy,

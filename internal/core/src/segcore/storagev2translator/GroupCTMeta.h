@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -78,17 +79,45 @@ ComputeRowGroupsPerCell(const std::vector<T>& row_group_sizes,
     return std::max<size_t>(n, 1);
 }
 
+// Cache-cell identity for a manifest column group.
+//
+// A cell is a (field, chunk) pair, NOT a whole-group chunk. This lets the
+// caching layer pin/evict/reserve one field's data for one chunk range
+// independently, so reading a filter column never co-loads sibling fields
+// (and an array field's 2x loading overhead stays on its own cells).
+//
+//   num_chunks_  : number of row-group ranges along the row dimension
+//   num_fields_  : number of user fields in this column group (excludes row_id)
+//   cid          = field_index * num_chunks_ + chunk_index
+//   num_cells    = num_fields_ * num_chunks_
+//
+// The chunk dimension (row-group ranges) is shared across all fields so a
+// given chunk_index maps to the same row region for every field.
 struct GroupCTMeta : public milvus::cachinglayer::Meta {
-    // num_rows_until_chunk_[i] = total rows(prefix sum) in cells [0, i-1]
-    // the size of num_rows_until_chunk_ is num_cells + 1
+    // num_rows_until_chunk_[i] = total rows(prefix sum) in chunks [0, i-1].
+    // Indexed by chunk_index; size is num_chunks_ + 1.
     std::vector<int64_t> num_rows_until_chunk_;
-    // memory size for each group chunk(cache cell)
+    // Per-cell memory size, indexed by cid = field_index*num_chunks_+chunk.
+    // Size is num_fields_ * num_chunks_.
     std::vector<int64_t> chunk_memory_size_;
     size_t num_fields_;
+    // Number of chunk (row-group range) cells along the row dimension.
+    // 0 means "whole-group mode": cells are whole-group chunks (cid == chunk,
+    // one GroupChunk per cell holds all fields), as produced by
+    // GroupChunkTranslator / JSON-key-stats. Non-zero means "per-field mode"
+    // (ManifestGroupTranslator): cells are (field, chunk).
+    size_t num_chunks_{0};
     // total number of row groups
     size_t total_row_groups_;
-    // Per-cell [start, end) row group range (global indices).
-    // Cells never span files — each cell's row groups come from the same file.
+    // Per-field_index: whether the field is an ARRAY type (drives 2x loading
+    // overhead only on that field's cells). Size is num_fields_.
+    std::vector<uint8_t> field_is_array_;
+    // Storage-column field id (FieldId::get()) -> field_index. Populated only
+    // in per-field mode; empty in whole-group mode.
+    std::unordered_map<int64_t, size_t> field_index_of_fid_;
+    // Per-chunk [start, end) row group range (global indices).
+    // Indexed by chunk_index; size is num_chunks_.
+    // Cells never span files — each chunk's row groups come from the same file.
     std::vector<std::pair<size_t, size_t>> cell_row_group_ranges_;
 
     GroupCTMeta(size_t num_fields,
@@ -110,10 +139,25 @@ struct GroupCTMeta : public milvus::cachinglayer::Meta {
           total_row_groups_(0) {
     }
 
+    // Decompose a cid into its (field_index, chunk_index).
+    size_t
+    field_index_of(size_t cid) const {
+        return num_chunks_ == 0 ? 0 : cid / num_chunks_;
+    }
+    size_t
+    chunk_index_of(size_t cid) const {
+        return num_chunks_ == 0 ? cid : cid % num_chunks_;
+    }
+    // Compose a cid from (field_index, chunk_index).
+    size_t
+    cid_of(size_t field_index, size_t chunk_index) const {
+        return field_index * num_chunks_ + chunk_index;
+    }
+
     // Get the range of row groups for a cell [start, end)
     std::pair<size_t, size_t>
     get_row_group_range(size_t cid) const {
-        return cell_row_group_ranges_[cid];
+        return cell_row_group_ranges_[chunk_index_of(cid)];
     }
 };
 

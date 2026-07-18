@@ -64,18 +64,20 @@ class ManifestGroupTranslatorTest : public ::testing::TestWithParam<bool> {
     // Helper to create a ManifestGroupTranslator for a given column group
     std::unique_ptr<ManifestGroupTranslator>
     MakeTranslator(int64_t cg_index, bool use_mmap) {
-        auto chunk_reader = test_data_->CreateChunkReader(cg_index);
+        auto reader = test_data_->CreateReader();
+        auto field_columns = test_data_->GetFieldColumns(cg_index);
         auto field_metas = test_data_->GetFieldMetas(cg_index);
         return std::make_unique<ManifestGroupTranslator>(
             segment_id_,
             GroupChunkType::DEFAULT,
             cg_index,
-            std::move(chunk_reader),
+            /*reader_cg_index=*/cg_index,
+            reader,
+            std::move(field_columns),
             field_metas,
             use_mmap,
             /*mmap_populate=*/true,
             mmap_dir_,
-            field_metas.size(),
             milvus::proto::common::LoadPriority::LOW,
             /*eager_load=*/true,
             /*warmup_policy=*/"");
@@ -115,8 +117,10 @@ TEST_P(ManifestGroupTranslatorTest, TestScalarColumnGroup) {
     auto row_group_sizes = chunk_reader->get_chunk_size().ValueOrDie();
     auto rgs_per_cell =
         ComputeRowGroupsPerCell(row_group_sizes, GetCellTargetSizeBytes());
-    auto expected_num_cells =
+    auto expected_num_chunks_dim =
         (expected_num_chunks + rgs_per_cell - 1) / rgs_per_cell;
+    // Cells are now (field, chunk): num_cells == num_fields * num_chunks.
+    auto expected_num_cells = expected_num_chunks_dim * field_metas.size();
     EXPECT_EQ(num_cells, expected_num_cells);
 
     // cell_id_of — identity mapping
@@ -311,9 +315,9 @@ TEST_P(ManifestGroupTranslatorTest, TestNumRowsUntilChunk) {
         auto translator = MakeTranslator(cg_idx, use_mmap);
         auto meta = static_cast<GroupCTMeta*>(translator->meta());
 
-        // num_rows_until_chunk_ is prefix sum with size = num_cells + 1
-        EXPECT_EQ(meta->num_rows_until_chunk_.size(),
-                  translator->num_cells() + 1);
+        // num_rows_until_chunk_ is a per-chunk prefix sum (row dimension),
+        // size = num_chunks + 1, independent of the number of fields.
+        EXPECT_EQ(meta->num_rows_until_chunk_.size(), meta->num_chunks_ + 1);
 
         // First element should be 0
         EXPECT_EQ(meta->num_rows_until_chunk_[0], 0);
@@ -345,26 +349,55 @@ TEST_P(ManifestGroupTranslatorTest, TestRowGroupRangesCoverage) {
     auto use_mmap = GetParam();
     auto translator = MakeTranslator(/*cg_index=*/0, use_mmap);
     auto meta = static_cast<GroupCTMeta*>(translator->meta());
-    auto num_cells = translator->num_cells();
 
-    EXPECT_EQ(meta->cell_row_group_ranges_.size(), num_cells);
+    // cell_row_group_ranges_ is per-chunk (row dimension), size = num_chunks.
+    EXPECT_EQ(meta->cell_row_group_ranges_.size(), meta->num_chunks_);
 
     auto chunk_reader = test_data_->CreateChunkReader(0);
     auto row_group_sizes = chunk_reader->get_chunk_size().ValueOrDie();
     auto rgs_per_cell =
         ComputeRowGroupsPerCell(row_group_sizes, GetCellTargetSizeBytes());
 
-    // Ranges should be contiguous and cover [0, total_row_groups_)
+    // Ranges should be contiguous and cover [0, total_row_groups_).
     size_t expected_start = 0;
-    for (size_t cid = 0; cid < num_cells; ++cid) {
-        auto [start, end] = meta->get_row_group_range(cid);
-        EXPECT_EQ(start, expected_start) << "gap at cid " << cid;
-        EXPECT_GT(end, start) << "empty range at cid " << cid;
+    for (size_t c = 0; c < meta->num_chunks_; ++c) {
+        auto [start, end] = meta->cell_row_group_ranges_[c];
+        EXPECT_EQ(start, expected_start) << "gap at chunk " << c;
+        EXPECT_GT(end, start) << "empty range at chunk " << c;
         EXPECT_LE(end - start, rgs_per_cell)
-            << "range too large at cid " << cid;
+            << "range too large at chunk " << c;
         expected_start = end;
     }
     EXPECT_EQ(expected_start, meta->total_row_groups_);
+}
+
+// Verify cells are per-(field, chunk): each cell's GroupChunk holds exactly
+// one field, and that field matches the cid's field_index. This is the core
+// column-projection guarantee — loading one field never materializes siblings.
+TEST_P(ManifestGroupTranslatorTest, TestPerFieldCells) {
+    auto use_mmap = GetParam();
+    auto translator = MakeTranslator(/*cg_index=*/0, use_mmap);
+    auto meta = static_cast<GroupCTMeta*>(translator->meta());
+    auto field_columns = test_data_->GetFieldColumns(0);
+    ASSERT_GT(meta->num_chunks_, 0u);
+    ASSERT_EQ(translator->num_cells(),
+              field_columns.size() * meta->num_chunks_);
+
+    std::vector<cachinglayer::cid_t> cids;
+    for (size_t i = 0; i < translator->num_cells(); ++i) {
+        cids.push_back(static_cast<cachinglayer::cid_t>(i));
+    }
+    auto cells = translator->get_cells(nullptr, cids);
+    ASSERT_EQ(cells.size(), cids.size());
+    for (auto& [cid, chunk] : cells) {
+        ASSERT_NE(chunk, nullptr) << "cid=" << cid;
+        // Each (field, chunk) cell must hold exactly one field's data.
+        EXPECT_EQ(chunk->GetChunks().size(), 1u) << "cid=" << cid;
+        auto fi = meta->field_index_of(cid);
+        auto expected_fid = field_columns[fi].first;
+        EXPECT_NE(chunk->GetChunk(expected_fid), nullptr)
+            << "cid=" << cid << " missing field " << expected_fid.get();
+    }
 }
 
 INSTANTIATE_TEST_SUITE_P(ManifestGroupTranslator,

@@ -7841,11 +7841,15 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
     // emits one entry per field, so each lazy entry produces a single-column
     // projected ChunkReader — touching one lazy field will not co-load chunks
     // for sibling lazy fields in the same column group.
-    auto needed_columns = std::make_shared<std::vector<std::string>>();
-    needed_columns->reserve(milvus_field_ids.size());
+    // Pass (FieldId, storage_column_name) pairs; the translator projects the
+    // Reader per field/subset itself and builds (field, chunk) cache cells so
+    // touching one field never co-loads sibling fields' bytes (nor an array
+    // field's 2x loading overhead).
+    std::vector<std::pair<FieldId, std::string>> field_columns;
+    field_columns.reserve(milvus_field_ids.size());
     for (const auto& fid : milvus_field_ids) {
-        needed_columns->push_back(
-            schema_snapshot->get_storage_column_name(fid));
+        field_columns.emplace_back(
+            fid, schema_snapshot->get_storage_column_name(fid));
     }
     auto reader =
         runtime != nullptr ? runtime->reader : CaptureReaderSnapshot();
@@ -7853,15 +7857,6 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
         reader != nullptr,
         "reader must exist before loading manifest column group, segment {}",
         get_segment_id());
-    auto chunk_reader_result = reader->get_chunk_reader(index, needed_columns);
-    AssertInfo(chunk_reader_result.ok(),
-               "get chunk reader failed, segment {}, column group index {}, "
-               "status msg: {}",
-               get_segment_id(),
-               index,
-               chunk_reader_result.status().ToString());
-
-    auto chunk_reader = std::move(chunk_reader_result).ValueOrDie();
 
     LOG_INFO("[StorageV2] segment {} loads manifest cg index {}",
              this->get_segment_id(),
@@ -7890,12 +7885,13 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
             get_segment_id(),
             GroupChunkType::DEFAULT,
             index,
-            std::move(chunk_reader),
+            /*reader_cg_index=*/index,
+            reader,
+            std::move(field_columns),
             field_metas,
             use_mmap,
             mmap_config.GetMmapPopulate(),
             mmap_dir_path,
-            milvus_field_ids.size(),
             segment_load_info.GetPriority(),
             eager_load,
             warmup_policy,
@@ -8000,11 +7996,13 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
                                      : mmap_config.GetScalarFieldEnableMmap();
     auto use_mmap = has_mmap_setting ? mmap_enabled : global_use_mmap;
 
-    auto needed_columns = std::make_shared<std::vector<std::string>>();
-    needed_columns->reserve(milvus_field_ids.size());
+    // Pass (FieldId, storage_column_name) pairs; the translator projects the
+    // Reader per field/subset itself and builds (field, chunk) cache cells.
+    std::vector<std::pair<FieldId, std::string>> field_columns;
+    field_columns.reserve(milvus_field_ids.size());
     for (const auto& fid : milvus_field_ids) {
-        needed_columns->push_back(
-            schema_snapshot->get_storage_column_name(fid));
+        field_columns.emplace_back(
+            fid, schema_snapshot->get_storage_column_name(fid));
     }
 
     auto reader = committer.runtime()->reader;
@@ -8012,15 +8010,6 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
         reader != nullptr,
         "reader must exist before loading manifest column group, segment {}",
         get_segment_id());
-    auto chunk_reader_result = reader->get_chunk_reader(index, needed_columns);
-    AssertInfo(chunk_reader_result.ok(),
-               "get chunk reader failed, segment {}, column group index {}, "
-               "status msg: {}",
-               get_segment_id(),
-               index,
-               chunk_reader_result.status().ToString());
-
-    auto chunk_reader = std::move(chunk_reader_result).ValueOrDie();
 
     LOG_INFO("[StorageV2] segment {} loads manifest cg index {}",
              this->get_segment_id(),
@@ -8043,12 +8032,13 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
             get_segment_id(),
             GroupChunkType::DEFAULT,
             index,
-            std::move(chunk_reader),
+            /*reader_cg_index=*/index,
+            reader,
+            std::move(field_columns),
             field_metas,
             use_mmap,
             mmap_config.GetMmapPopulate(),
             mmap_dir_path,
-            milvus_field_ids.size(),
             segment_load_info.GetPriority(),
             eager_load,
             warmup_policy,

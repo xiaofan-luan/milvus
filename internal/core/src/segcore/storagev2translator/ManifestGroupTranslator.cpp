@@ -22,7 +22,11 @@
 #include <exception>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -66,12 +70,13 @@ ManifestGroupTranslator::ManifestGroupTranslator(
     int64_t segment_id,
     GroupChunkType group_chunk_type,
     int64_t column_group_index,
-    std::shared_ptr<milvus_storage::api::ChunkReader> chunk_reader,
+    int64_t reader_cg_index,
+    std::shared_ptr<milvus_storage::api::Reader> reader,
+    std::vector<std::pair<FieldId, std::string>> field_columns,
     const std::unordered_map<FieldId, FieldMeta>& field_metas,
     bool use_mmap,
     bool mmap_populate,
     const std::string& mmap_dir_path,
-    int64_t num_fields,
     milvus::proto::common::LoadPriority load_priority,
     bool eager_load,
     const std::string& warmup_policy,
@@ -81,7 +86,7 @@ ManifestGroupTranslator::ManifestGroupTranslator(
     : segment_id_(segment_id),
       group_chunk_type_(group_chunk_type),
       column_group_index_(column_group_index),
-      chunk_reader_(std::move(chunk_reader)),
+      reader_cg_index_(reader_cg_index),
       key_(cache_key_suffix.empty()
                ? fmt::format("seg_{}_cg_{}", segment_id, column_group_index)
                : fmt::format("seg_{}_cg_{}_{}",
@@ -89,8 +94,8 @@ ManifestGroupTranslator::ManifestGroupTranslator(
                              column_group_index,
                              cache_key_suffix)),
       field_metas_(field_metas),
-      mmap_dir_path_(mmap_dir_path),
-      meta_(num_fields,
+      reader_(std::move(reader)),
+      meta_(field_columns.size(),
             use_mmap ? milvus::cachinglayer::StorageType::DISK
                      : milvus::cachinglayer::StorageType::MEMORY,
             milvus::cachinglayer::CellIdMappingMode::IDENTICAL,
@@ -123,80 +128,124 @@ ManifestGroupTranslator::ManifestGroupTranslator(
             std::move(shard)),
       use_mmap_(use_mmap),
       mmap_populate_(mmap_populate),
-      has_array_field_(std::any_of(field_metas_.begin(),
-                                   field_metas_.end(),
-                                   [](const auto& field) {
-                                       return field.second.get_data_type() ==
-                                              DataType::ARRAY;
-                                   })),
+      mmap_dir_path_(mmap_dir_path),
       load_priority_(load_priority) {
-    auto chunk_size_result = chunk_reader_->get_chunk_size();
-    if (!chunk_size_result.ok()) {
-        throw std::runtime_error(
-            fmt::format("get row group size failed: {}",
-                        chunk_size_result.status().ToString()));
+    // ---- field ordering / reverse lookup / storage column names ----
+    const size_t num_fields = field_columns.size();
+    field_order_.reserve(num_fields);
+    field_storage_columns_.reserve(num_fields);
+    field_readers_.assign(num_fields, nullptr);
+    for (size_t fi = 0; fi < num_fields; ++fi) {
+        field_order_.push_back(field_columns[fi].first);
+        field_storage_columns_.push_back(field_columns[fi].second);
+        meta_.field_index_of_fid_[field_columns[fi].first.get()] = fi;
     }
-    const auto& row_group_sizes = chunk_size_result.ValueOrDie();
 
-    auto rows_result = chunk_reader_->get_chunk_rows();
-    if (!rows_result.ok()) {
-        throw std::runtime_error(fmt::format("get row group rows failed: {}",
-                                             rows_result.status().ToString()));
+    // ---- probe per-field, per-row-group sizes via single-column readers ----
+    // All fields share the same row groups (same file), so the row-group
+    // count and per-row-group row counts come from any field; the byte sizes
+    // are per-field (each single-column ChunkReader reports its own column's
+    // size). Building the per-field readers here also warms field_readers_ so
+    // get_cells never has to build a reader on the hot path.
+    std::vector<std::vector<int64_t>> per_field_rg_sizes(num_fields);
+    std::vector<uint64_t> row_group_rows;
+    size_t total_row_groups = 0;
+    for (size_t fi = 0; fi < num_fields; ++fi) {
+        auto cr = field_chunk_reader(fi);
+        auto size_result = cr->get_chunk_size();
+        if (!size_result.ok()) {
+            throw std::runtime_error(
+                fmt::format("get row group size failed for field {}: {}",
+                            field_storage_columns_[fi],
+                            size_result.status().ToString()));
+        }
+        const auto& sizes = size_result.ValueOrDie();
+        per_field_rg_sizes[fi].assign(sizes.begin(), sizes.end());
+        if (fi == 0) {
+            total_row_groups = sizes.size();
+            auto rows_result = cr->get_chunk_rows();
+            if (!rows_result.ok()) {
+                throw std::runtime_error(
+                    fmt::format("get row group rows failed: {}",
+                                rows_result.status().ToString()));
+            }
+            row_group_rows = rows_result.ValueOrDie();
+        }
     }
-    const auto& row_group_rows = rows_result.ValueOrDie();
 
-    // Merge row groups into group chunks(cache cells). Derive row-groups-
-    // per-cell from the runtime-configurable target byte size so avg cell
-    // byte size ≈ target.
+    // ---- row-groups-per-chunk from the FULL row-group size ----
+    // NOTE: milvus-storage get_chunk_size() returns each row group's
+    // total_byte_size (ALL columns) regardless of the reader's column
+    // projection, so every per-field reader reports the same full-row-group
+    // size. Use one of them as the group total; summing across fields would
+    // N-fold inflate it and produce N x too many chunks.
+    std::vector<int64_t> group_rg_sizes =
+        num_fields > 0 ? per_field_rg_sizes[0]
+                       : std::vector<int64_t>(total_row_groups, 0);
     const int64_t cell_target_size_bytes = GetCellTargetSizeBytes();
-    size_t total_row_groups = row_group_sizes.size();
     meta_.total_row_groups_ = total_row_groups;
     const size_t rgs_per_cell =
-        ComputeRowGroupsPerCell(row_group_sizes, cell_target_size_bytes);
-    size_t num_cells = (total_row_groups + rgs_per_cell - 1) / rgs_per_cell;
+        ComputeRowGroupsPerCell(group_rg_sizes, cell_target_size_bytes);
+    const size_t num_chunks =
+        (total_row_groups + rgs_per_cell - 1) / rgs_per_cell;
+    meta_.num_chunks_ = num_chunks;
 
-    // Populate cell_row_group_ranges_ (single data source, no multi-file)
-    meta_.cell_row_group_ranges_.reserve(num_cells);
-    for (size_t cid = 0; cid < num_cells; ++cid) {
-        size_t start = cid * rgs_per_cell;
+    // ---- per-chunk row-group ranges + prefix-sum rows (field-independent) --
+    meta_.cell_row_group_ranges_.reserve(num_chunks);
+    meta_.num_rows_until_chunk_.reserve(num_chunks + 1);
+    meta_.num_rows_until_chunk_.push_back(0);
+    std::vector<int64_t> chunk_rows(num_chunks, 0);
+    int64_t cumulative_rows = 0;
+    for (size_t c = 0; c < num_chunks; ++c) {
+        size_t start = c * rgs_per_cell;
         size_t end = std::min(start + rgs_per_cell, total_row_groups);
         meta_.cell_row_group_ranges_.push_back({start, end});
+        int64_t rows = 0;
+        for (size_t r = start; r < end; ++r) {
+            rows += static_cast<int64_t>(row_group_rows[r]);
+        }
+        chunk_rows[c] = rows;
+        cumulative_rows += rows;
+        meta_.num_rows_until_chunk_.push_back(cumulative_rows);
     }
 
-    // Build num_rows_until_chunk_ and chunk_memory_size_
-    meta_.num_rows_until_chunk_.reserve(num_cells + 1);
-    meta_.num_rows_until_chunk_.push_back(0);
-    meta_.chunk_memory_size_.reserve(num_cells);
+    // ---- per-field ARRAY flag (drives 2x overhead only on that field) ----
+    meta_.field_is_array_.reserve(num_fields);
+    for (size_t fi = 0; fi < num_fields; ++fi) {
+        auto it = field_metas_.find(field_order_[fi]);
+        bool is_array = it != field_metas_.end() &&
+                        it->second.get_data_type() == DataType::ARRAY;
+        meta_.field_is_array_.push_back(is_array ? 1 : 0);
+    }
 
-    int64_t cumulative_rows = 0;
+    // ---- per-(field,chunk) cell sizes, indexed by cid = fi*num_chunks + c --
+    // milvus-storage cannot report per-column row-group sizes (get_chunk_size
+    // is the full row group), so approximate each field's share of a chunk as
+    // an even fraction of the full-row-group bytes over that chunk's range. A
+    // precise per-field size would need a milvus-storage API exposing
+    // per-column-chunk metadata. An array field still gets 2x its share via
+    // loading_overhead_bytes.
+    meta_.chunk_memory_size_.assign(num_fields * num_chunks, 0);
     int64_t last_resort_cells = 0;
-    for (size_t cell_id = 0; cell_id < num_cells; ++cell_id) {
-        auto [start, end] = meta_.get_row_group_range(cell_id);
-        int64_t cell_size = 0;
-        int64_t cell_rows = 0;
-        for (size_t i = start; i < end; ++i) {
-            cell_rows += static_cast<int64_t>(row_group_rows[i]);
-            cumulative_rows += static_cast<int64_t>(row_group_rows[i]);
-            cell_size += static_cast<int64_t>(row_group_sizes[i]);
+    const int64_t nf = std::max<int64_t>(1, static_cast<int64_t>(num_fields));
+    for (size_t fi = 0; fi < num_fields; ++fi) {
+        const auto& s = per_field_rg_sizes[fi];
+        for (size_t c = 0; c < num_chunks; ++c) {
+            auto [start, end] = meta_.cell_row_group_ranges_[c];
+            int64_t full_range_bytes = 0;
+            for (size_t r = start; r < end && r < s.size(); ++r) {
+                full_range_bytes += s[r];
+            }
+            int64_t cell_size = full_range_bytes / nf;  // even per-field share
+            if (fallback_bytes_per_row > 0 && chunk_rows[c] > 0) {
+                cell_size = (chunk_rows[c] * fallback_bytes_per_row) / nf;
+            } else if (cell_size == 0 && chunk_rows[c] > 0) {
+                constexpr int64_t kLastResortBytesPerRow = 4096;
+                cell_size = chunk_rows[c] * kLastResortBytesPerRow / nf;
+                ++last_resort_cells;
+            }
+            meta_.chunk_memory_size_[meta_.cid_of(fi, c)] = cell_size;
         }
-        // External segments (fallback_bytes_per_row > 0): always prefer the
-        // DataNode-sampled Arrow bytes/row over format metadata. The
-        // metadata reports disk/encoded size which varies by format
-        // (parquet=uncompressed column chunk size, iceberg/vortex=often 0)
-        // and is not a reliable proxy for in-memory Arrow buffer size.
-        //
-        // Non-external: use format metadata; only if it reports zero
-        // (e.g. Vortex without size stats) fall back to a 4KB/row
-        // last-resort estimate.
-        if (fallback_bytes_per_row > 0 && cell_rows > 0) {
-            cell_size = cell_rows * fallback_bytes_per_row;
-        } else if (cell_size == 0 && cell_rows > 0) {
-            constexpr int64_t kLastResortBytesPerRow = 4096;
-            cell_size = cell_rows * kLastResortBytesPerRow;
-            ++last_resort_cells;
-        }
-        meta_.num_rows_until_chunk_.push_back(cumulative_rows);
-        meta_.chunk_memory_size_.push_back(cell_size);
     }
     if (last_resort_cells > 0) {
         LOG_WARN(
@@ -205,22 +254,32 @@ ManifestGroupTranslator::ManifestGroupTranslator(
             "4KB/row last-resort estimate",
             key_,
             last_resort_cells,
-            num_cells);
+            num_fields * num_chunks);
     }
 
     LOG_INFO(
-        "[StorageV2] translator {} merged {} row groups into {} cells "
-        "(cell_target_size_bytes={})",
+        "[StorageV2] translator {}: {} fields x {} chunks = {} cells "
+        "({} row groups, cell_target_size_bytes={})",
         key_,
+        num_fields,
+        num_chunks,
+        num_fields * num_chunks,
         total_row_groups,
-        num_cells,
         cell_target_size_bytes);
 
     // Set loading overhead config to cap total transient memory reservation.
+    // Overhead is per-(field,chunk); use the max across cells (an array
+    // field's cell contributes 2x its size).
     if (!meta_.chunk_memory_size_.empty()) {
-        int64_t max_cell_sz = *std::max_element(
-            meta_.chunk_memory_size_.begin(), meta_.chunk_memory_size_.end());
-        auto max_overhead_size = loading_overhead_bytes(max_cell_sz);
+        int64_t max_cell_sz = 0;
+        int64_t max_overhead_size = 0;
+        for (size_t cid = 0; cid < meta_.chunk_memory_size_.size(); ++cid) {
+            int64_t sz = meta_.chunk_memory_size_[cid];
+            max_cell_sz = std::max(max_cell_sz, sz);
+            max_overhead_size = std::max(
+                max_overhead_size,
+                loading_overhead_bytes(meta_.field_index_of(cid), sz));
+        }
         auto upper_bound = milvus::segcore::FieldDataLoadingOverheadUpperBound(
             max_overhead_size,
             use_mmap_ ? std::optional<int64_t>{max_cell_sz} : std::nullopt);
@@ -230,6 +289,64 @@ ManifestGroupTranslator::ManifestGroupTranslator(
         meta_.loading_overhead =
             milvus::cachinglayer::LoadingOverheadConfig{upper_bound, group};
     }
+}
+
+std::shared_ptr<milvus_storage::api::ChunkReader>
+ManifestGroupTranslator::field_chunk_reader(size_t field_index) {
+    if (field_readers_[field_index] != nullptr) {
+        return field_readers_[field_index];
+    }
+    auto needed = std::make_shared<std::vector<std::string>>();
+    needed->push_back(field_storage_columns_[field_index]);
+    auto result = reader_->get_chunk_reader(reader_cg_index_, needed);
+    AssertInfo(result.ok(),
+               "[StorageV2] translator {} get_chunk_reader failed for field "
+               "{} (col {}): {}",
+               key_,
+               field_index,
+               field_storage_columns_[field_index],
+               result.status().ToString());
+    field_readers_[field_index] = std::move(result).ValueOrDie();
+    return field_readers_[field_index];
+}
+
+std::shared_ptr<milvus_storage::api::ChunkReader>
+ManifestGroupTranslator::subset_chunk_reader(
+    const std::vector<size_t>& sorted_field_indices) {
+    // Single-field subset reuses the per-field reader cache.
+    if (sorted_field_indices.size() == 1) {
+        return field_chunk_reader(sorted_field_indices[0]);
+    }
+    std::string cache_key;
+    for (auto fi : sorted_field_indices) {
+        cache_key += std::to_string(fi);
+        cache_key += ',';
+    }
+    {
+        std::lock_guard<std::mutex> lk(subset_readers_mu_);
+        auto it = subset_readers_.find(cache_key);
+        if (it != subset_readers_.end()) {
+            return it->second;
+        }
+    }
+    auto needed = std::make_shared<std::vector<std::string>>();
+    needed->reserve(sorted_field_indices.size());
+    for (auto fi : sorted_field_indices) {
+        needed->push_back(field_storage_columns_[fi]);
+    }
+    auto result = reader_->get_chunk_reader(reader_cg_index_, needed);
+    AssertInfo(result.ok(),
+               "[StorageV2] translator {} get_chunk_reader failed for subset "
+               "[{}]: {}",
+               key_,
+               cache_key,
+               result.status().ToString());
+    std::shared_ptr<milvus_storage::api::ChunkReader> reader =
+        std::move(result).ValueOrDie();
+    std::lock_guard<std::mutex> lk(subset_readers_mu_);
+    // Another thread may have inserted concurrently; keep the first.
+    auto [it, inserted] = subset_readers_.emplace(cache_key, reader);
+    return it->second;
 }
 
 size_t
@@ -248,7 +365,7 @@ ManifestGroupTranslator::estimated_byte_size_of_cell(
     milvus::cachinglayer::cid_t cid) const {
     assert(cid < meta_.chunk_memory_size_.size());
     auto cell_sz = meta_.chunk_memory_size_[cid];
-    auto overhead_sz = loading_overhead_bytes(cell_sz);
+    auto overhead_sz = loading_overhead_bytes(meta_.field_index_of(cid), cell_sz);
 
     if (use_mmap_) {
         return {{0, cell_sz}, {overhead_sz, cell_sz}};
@@ -274,6 +391,9 @@ ManifestGroupTranslator::get_cells(
                           std::unique_ptr<milvus::GroupChunk>>>
         cells;
     cells.reserve(cids.size());
+    if (cids.empty()) {
+        return cells;
+    }
 
     auto max_cid = *std::max_element(cids.begin(), cids.end());
     if (max_cid >= meta_.chunk_memory_size_.size()) {
@@ -285,104 +405,128 @@ ManifestGroupTranslator::get_cells(
             meta_.chunk_memory_size_.size());
     }
 
-    // Build CellSpec for each requested cid
-    std::vector<milvus::segcore::CellSpec> cell_specs;
-    cell_specs.reserve(cids.size());
+    // Coalesced read. Group requested cids by chunk, then by the field-subset
+    // needed for that chunk, so all fields of a chunk are read in ONE projected
+    // IO and split into per-(field,chunk) cells. A single field is the
+    // degenerate subset {field}. cid = field_index * num_chunks + chunk_index.
+    std::map<size_t /*chunk*/, std::set<size_t> /*field_indices*/>
+        fields_by_chunk;
     for (auto cid : cids) {
-        auto [start, end] = meta_.get_row_group_range(cid);
-        cell_specs.push_back(
-            {cid,
-             /*file_idx=*/0,
-             static_cast<int64_t>(start),
-             static_cast<int64_t>(end - start),
-             meta_.chunk_memory_size_[cid],
-             loading_overhead_bytes(meta_.chunk_memory_size_[cid])});
+        fields_by_chunk[meta_.chunk_index_of(cid)].insert(
+            meta_.field_index_of(cid));
+    }
+    // Chunks that request the SAME field-subset share one reader and one
+    // LoadCellBatchAsync (IO-merged). Key = sorted field indices.
+    std::map<std::vector<size_t>, std::vector<size_t>> chunks_by_subset;
+    for (auto& [chunk, fset] : fields_by_chunk) {
+        std::vector<size_t> subset(fset.begin(), fset.end());  // set => sorted
+        chunks_by_subset[subset].push_back(chunk);
     }
 
-    // Create factory using ChunkReader — reads a batch of row groups at once
-    auto factory = milvus::segcore::MakeChunkReaderFactory(chunk_reader_);
-
-    // Submit cell-batch loading tasks
-    auto& pool = milvus::ThreadPools::GetThreadPool(
-        milvus::PriorityForLoad(load_priority_));
-    auto channel = std::make_shared<milvus::segcore::CellReaderChannel>(
-        static_cast<size_t>(pool.GetMaxThreadNum() *
-                            milvus::segcore::kChannelCapacityMultiplier));
-
-    auto load_futures = milvus::segcore::LoadCellBatchAsync(
-        ctx,
-        std::move(cell_specs),
-        std::move(factory),
-        channel,
-        FieldDataLoadBatchSplitTargetBytes(),
-        load_priority_,
-        [this](const std::vector<std::shared_ptr<arrow::Table>>& tables,
-               int64_t cid) {
-            return load_group_chunk(
-                tables, static_cast<milvus::cachinglayer::cid_t>(cid));
-        });
-
-    LOG_INFO(
-        "[StorageV2] translator {} submits {} batch tasks for manifest "
-        "column group {}",
-        key_,
-        load_futures.size(),
-        column_group_index_);
-
-    // Pop loop — batch tasks finalize cells before pushing.
     std::unordered_map<milvus::cachinglayer::cid_t,
                        std::unique_ptr<milvus::GroupChunk>>
         completed_cells;
     completed_cells.reserve(cids.size());
 
-    try {
-        std::shared_ptr<milvus::segcore::CellLoadResult> cell_data;
-        while (channel->pop(cell_data)) {
-            try {
-                CheckCancellation(
-                    ctx, segment_id_, "ManifestGroupTranslator::get_cells()");
-                AssertInfo(cell_data->chunk != nullptr,
-                           "[StorageV2] translator {} cell {} is not "
-                           "finalized by batch task",
-                           key_,
-                           cell_data->cid);
-                completed_cells[cell_data->cid] = std::move(cell_data->chunk);
-                milvus::segcore::ReleaseCellLoadResultBudget(cell_data);
-            } catch (...) {
-                milvus::segcore::ReleaseCellLoadResultBudget(cell_data);
-                throw;
-            }
-        }
-    } catch (...) {
-        // Drain the channel to unblock producers that may be stuck on push()
-        // to a full bounded channel. Without draining, producers block forever
-        // and their task_guard (which calls channel->close()) never executes.
-        std::shared_ptr<milvus::segcore::CellLoadResult> discard;
-        try {
-            while (channel->pop(discard)) {
-                milvus::segcore::ReleaseCellLoadResultBudget(discard);
-            }
-        } catch (...) {
-            LOG_WARN("drain channel exception swallowed");
-        }
-        try {
-            storage::WaitAllFutures(load_futures);
-        } catch (const std::exception& e) {
-            LOG_WARN(
-                "[StorageV2] translator {} cleanup ignored background load "
-                "exception after cancellation: {}",
-                key_,
-                e.what());
-        } catch (...) {
-            LOG_WARN(
-                "[StorageV2] translator {} cleanup ignored unknown background "
-                "load exception after cancellation",
-                key_);
-        }
-        throw;
-    }
+    auto& pool = milvus::ThreadPools::GetThreadPool(
+        milvus::PriorityForLoad(load_priority_));
 
-    storage::WaitAllFutures(load_futures);
+    for (auto& [subset, chunks] : chunks_by_subset) {
+        auto reader = subset_chunk_reader(subset);
+
+        // One CellSpec per chunk (cid == chunk index). Size/overhead is summed
+        // over the subset's fields for that chunk.
+        std::vector<milvus::segcore::CellSpec> cell_specs;
+        cell_specs.reserve(chunks.size());
+        for (auto chunk : chunks) {
+            auto [start, end] = meta_.cell_row_group_ranges_[chunk];
+            int64_t sz = 0;
+            int64_t overhead = 0;
+            for (auto fi : subset) {
+                auto cell_sz =
+                    meta_.chunk_memory_size_[meta_.cid_of(fi, chunk)];
+                sz += cell_sz;
+                overhead += loading_overhead_bytes(fi, cell_sz);
+            }
+            cell_specs.push_back({static_cast<int64_t>(chunk),
+                                  /*file_idx=*/0,
+                                  static_cast<int64_t>(start),
+                                  static_cast<int64_t>(end - start),
+                                  sz,
+                                  overhead});
+        }
+
+        auto factory = milvus::segcore::MakeChunkReaderFactory(reader);
+        auto channel = std::make_shared<milvus::segcore::CellReaderChannel>(
+            static_cast<size_t>(pool.GetMaxThreadNum() *
+                                milvus::segcore::kChannelCapacityMultiplier));
+
+        // finalize == nullptr: the batch returns raw Arrow tables (all subset
+        // columns for the chunk); we split them into per-field cells below.
+        auto load_futures = milvus::segcore::LoadCellBatchAsync(
+            ctx,
+            std::move(cell_specs),
+            std::move(factory),
+            channel,
+            FieldDataLoadBatchSplitTargetBytes(),
+            load_priority_,
+            /*finalize_cell=*/nullptr);
+
+        try {
+            std::shared_ptr<milvus::segcore::CellLoadResult> cell_data;
+            while (channel->pop(cell_data)) {
+                try {
+                    CheckCancellation(ctx,
+                                      segment_id_,
+                                      "ManifestGroupTranslator::get_cells()");
+                    auto chunk = static_cast<size_t>(cell_data->cid);
+                    // Split this chunk's subset tables into per-field cells;
+                    // must run before releasing the budget (which clears
+                    // cell_data->tables).
+                    for (auto fi : subset) {
+                        auto cell_cid = meta_.cid_of(fi, chunk);
+                        completed_cells[cell_cid] = load_group_chunk(
+                            cell_data->tables,
+                            static_cast<milvus::cachinglayer::cid_t>(cell_cid),
+                            field_order_[fi]);
+                    }
+                    milvus::segcore::ReleaseCellLoadResultBudget(cell_data);
+                } catch (...) {
+                    milvus::segcore::ReleaseCellLoadResultBudget(cell_data);
+                    throw;
+                }
+            }
+        } catch (...) {
+            // Drain the channel to unblock producers stuck on push() to a full
+            // bounded channel; otherwise their task_guard (which closes the
+            // channel) never runs.
+            std::shared_ptr<milvus::segcore::CellLoadResult> discard;
+            try {
+                while (channel->pop(discard)) {
+                    milvus::segcore::ReleaseCellLoadResultBudget(discard);
+                }
+            } catch (...) {
+                LOG_WARN("drain channel exception swallowed");
+            }
+            try {
+                storage::WaitAllFutures(load_futures);
+            } catch (const std::exception& e) {
+                LOG_WARN(
+                    "[StorageV2] translator {} cleanup ignored background load "
+                    "exception after cancellation: {}",
+                    key_,
+                    e.what());
+            } catch (...) {
+                LOG_WARN(
+                    "[StorageV2] translator {} cleanup ignored unknown "
+                    "background load exception after cancellation",
+                    key_);
+            }
+            throw;
+        }
+
+        storage::WaitAllFutures(load_futures);
+    }
 
     for (auto cid : cids) {
         auto it = completed_cells.find(cid);
@@ -399,7 +543,8 @@ ManifestGroupTranslator::get_cells(
 std::unique_ptr<milvus::GroupChunk>
 ManifestGroupTranslator::load_group_chunk(
     const std::vector<std::shared_ptr<arrow::Table>>& tables,
-    const milvus::cachinglayer::cid_t cid) {
+    const milvus::cachinglayer::cid_t cid,
+    std::optional<FieldId> only_field) {
     assert(!tables.empty());
     // Use the first table's schema as reference for field iteration
     const auto& schema = tables[0]->schema();
@@ -445,6 +590,11 @@ ManifestGroupTranslator::load_group_chunk(
         auto fid = milvus::FieldId(field_id);
         if (fid == RowFieldID) {
             // ignore row id field
+            continue;
+        }
+        // Coalesced split: materialize only the requested field, leaving the
+        // other columns in `tables` for their own per-field cells.
+        if (only_field.has_value() && fid != *only_field) {
             continue;
         }
         auto it = field_metas_.find(fid);
@@ -527,8 +677,11 @@ ManifestGroupTranslator::load_group_chunk(
 }
 
 int64_t
-ManifestGroupTranslator::loading_overhead_bytes(int64_t cell_size) const {
-    if (!has_array_field_) {
+ManifestGroupTranslator::loading_overhead_bytes(size_t field_index,
+                                                int64_t cell_size) const {
+    bool is_array = field_index < meta_.field_is_array_.size() &&
+                    meta_.field_is_array_[field_index] != 0;
+    if (!is_array) {
         return cell_size;
     }
     if (cell_size > std::numeric_limits<int64_t>::max() / 2) {
