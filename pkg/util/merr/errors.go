@@ -178,6 +178,13 @@ var (
 	// Prefer ErrIo*/ErrSerializationFailed/ErrDataIntegrity/ErrParameterInvalid
 	// when they fit; reach for ErrStorage only when none of those describe the failure.
 	ErrStorage = newMilvusError("storage internal error", 1008, false, WithErrorType(SystemError))
+	// ErrStorageTransient is the retriable counterpart of ErrStorage: a storage
+	// failure the caller may reasonably re-run (object-store blip, loon FFI
+	// transaction conflict, manifest commit contention). It exists so a storage
+	// layer can attach a storage wire code to a transient cause WITHOUT silently
+	// downgrading it to non-retriable — see WrapErrStorage, which promotes to this
+	// sentinel when the cause it relabels is itself retriable.
+	ErrStorageTransient = newMilvusError("storage transient error", 1013, true, WithErrorType(SystemError))
 
 	// Permanent errors - resource doesn't exist or access denied
 	ErrIoPermissionDenied   = newMilvusError("permission denied", 1005, false)

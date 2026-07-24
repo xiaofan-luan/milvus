@@ -321,7 +321,12 @@ func HandleLoonFFIResult(ffiResult C.LoonFFIResult) error {
 			errStr = C.GoString(errMsg)
 		}
 
-		return merr.Wrapf(ErrLoonTransient, "FFI operation failed: %s", errStr)
+		// Label it with the retriable storage sentinel, not a bare marker: the
+		// ErrLoonTransient chain stays reachable for errors.Is, while callers that
+		// relabel this with merr.WrapErrStorage (to attach a storage wire code
+		// instead of leaking 65535) no longer silently downgrade it to permanent —
+		// WrapErrStorage promotes a retriable cause to ErrStorageTransient.
+		return merr.WrapErrStorageTransient(ErrLoonTransient, "FFI operation failed: %s", errStr)
 	}
 	return nil
 }

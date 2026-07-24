@@ -24,6 +24,7 @@ import (
 
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
@@ -334,6 +335,20 @@ func TestWrapErrPreservesInnerChain(t *testing.T) {
 			code:     ErrMqInternal.errCode,
 		},
 		{
+			name:     "IllegalCompactionPlan",
+			wrap:     func() error { return WrapErrIllegalCompactionPlanErr(inner, "ctx %s", "test") },
+			sentinel: ErrIllegalCompactionPlan,
+			other:    ErrServiceInternal,
+			code:     ErrIllegalCompactionPlan.errCode,
+		},
+		{
+			name:     "StorageTransient",
+			wrap:     func() error { return WrapErrStorageTransient(inner, "ctx %s", "test") },
+			sentinel: ErrStorageTransient,
+			other:    ErrServiceInternal,
+			code:     ErrStorageTransient.errCode,
+		},
+		{
 			name:     "BuildCompactionRequestFail",
 			wrap:     func() error { return WrapErrBuildCompactionRequestFail(inner) },
 			sentinel: ErrBuildCompactionRequestFail,
@@ -381,4 +396,40 @@ func TestWrapErrPreservesInnerChain(t *testing.T) {
 
 	// nil err falls back to the Msg variant; just make sure that still works.
 	assert.True(t, errors.Is(WrapErrServiceInternalErr(nil, "no underlying err"), ErrServiceInternal))
+}
+
+// TestWrapErrStorageKeepsCauseRetriability locks in the invariant that attaching
+// the storage wire code must not silently downgrade a retriable cause. packed
+// relabels every loon FFI failure with WrapErrStorage to avoid leaking code
+// 65535; before this, the non-retriable ErrStorage became the OUTERMOST milvus
+// error, so IsRetryableErr reported false and a recoverable transaction conflict
+// permanently failed the caller's job.
+func TestWrapErrStorageKeepsCauseRetriability(t *testing.T) {
+	t.Run("retriable cause is promoted", func(t *testing.T) {
+		cause := WrapErrIoTooManyRequests("k", errors.New("throttled"))
+		require.True(t, IsRetryableErr(cause))
+
+		wrapped := WrapErrStorage(cause, "commit manifest begin")
+		assert.True(t, IsRetryableErr(wrapped), "relabeling must not drop retriability")
+		assert.True(t, errors.Is(wrapped, ErrStorageTransient))
+		assert.True(t, errors.Is(wrapped, ErrIoTooManyRequests), "cause stays reachable")
+		assert.Contains(t, wrapped.Error(), "commit manifest begin")
+	})
+
+	t.Run("non-retriable cause stays permanent", func(t *testing.T) {
+		cause := WrapErrDataIntegrityMsg("corrupt manifest")
+		require.False(t, IsRetryableErr(cause))
+
+		wrapped := WrapErrStorage(cause, "commit manifest begin")
+		assert.False(t, IsRetryableErr(wrapped))
+		assert.True(t, errors.Is(wrapped, ErrStorage))
+		assert.True(t, errors.Is(wrapped, ErrDataIntegrity), "cause stays reachable")
+	})
+
+	t.Run("double relabel still retriable", func(t *testing.T) {
+		// packed wraps once inside HandleLoonFFIResult and again at the call site.
+		inner := WrapErrStorageTransient(errors.New("loon FFI transient error"), "FFI operation failed")
+		wrapped := WrapErrStorage(inner, "commit manifest begin")
+		assert.True(t, IsRetryableErr(wrapped))
+	})
 }

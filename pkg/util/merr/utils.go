@@ -1124,7 +1124,25 @@ func WrapErrStorage(err error, format string, args ...any) error {
 	if err == nil {
 		return WrapErrStorageMsg(format, args...)
 	}
+	// Relabeling a cause to attach the storage wire code must NOT silently drop
+	// its retriability. ErrStorage is non-retriable, and because IsRetryableErr
+	// reads the OUTERMOST milvus error, a plain relabel would turn a recoverable
+	// object-store / loon-FFI failure into a permanent one for every caller.
+	// Promote to the retriable sibling instead when the cause is itself retriable.
+	if IsRetryableErr(err) {
+		return wrapInner(ErrStorageTransient, formatMsg(format, args...), err)
+	}
 	return wrapInner(ErrStorage, formatMsg(format, args...), err)
+}
+
+// WrapErrStorageTransient labels a retriable storage failure (object-store blip,
+// FFI transaction conflict, manifest commit contention) with a storage wire code
+// while keeping the cause reachable through Unwrap.
+func WrapErrStorageTransient(err error, format string, args ...any) error {
+	if err == nil {
+		return wrapMsg(ErrStorageTransient, format, args...)
+	}
+	return wrapInner(ErrStorageTransient, formatMsg(format, args...), err)
 }
 
 // WrapErrFunctionFailedMsg creates a new ErrFunctionFailed (code 2400) with a
@@ -1535,6 +1553,18 @@ func WrapErrIllegalCompactionPlan(msg ...string) error {
 
 func WrapErrIllegalCompactionPlanMsg(format string, args ...any) error {
 	return wrapMsg(ErrIllegalCompactionPlan, format, args...)
+}
+
+// WrapErrIllegalCompactionPlanErr relabels an underlying rejection as an illegal
+// compaction plan while keeping the cause reachable through Unwrap. Relabeling is
+// deliberate here: the compaction task state machine keys off
+// errors.Is(err, ErrIllegalCompactionPlan) to fail the task, so that identity has
+// to survive — but the cause must not be flattened into the message with %v.
+func WrapErrIllegalCompactionPlanErr(err error, format string, args ...any) error {
+	if err == nil {
+		return WrapErrIllegalCompactionPlanMsg(format, args...)
+	}
+	return wrapInner(ErrIllegalCompactionPlan, formatMsg(format, args...), err)
 }
 
 func WrapErrCompactionPlanConflict(msg ...string) error {
