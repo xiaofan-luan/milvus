@@ -1109,9 +1109,15 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
                 return false;
             }
         }
-        c_.resize(sigma_);
+        // Read the stored C-table into a scratch buffer rather than into c_.
+        // It cannot be checked here (the wavelet it summarises is not parsed
+        // yet) and it feeds the least defended arithmetic in the file:
+        // `c_[id] - first_[id]` in BackwardSearch/CountBatch, whose result is
+        // used as a row index by locateRow/LF with no bounds check. c_ is
+        // rebuilt from the wavelet below; this copy is only compared against.
+        std::vector<uint64_t> stored_c(sigma_);
         for (uint32_t i = 0; i < sigma_; ++i) {
-            c_[i] = get<uint64_t>(p, end);
+            stored_c[i] = get<uint64_t>(p, end);
         }
         std::vector<std::array<size_t, 4>> starts(qlevels_);
         for (uint32_t l = 0; l < qlevels_; ++l) {
@@ -1189,6 +1195,31 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
         }
         wm_ = WaveletMatrix4::from_parts(
             m, qlevels_, std::move(qvs), std::move(starts));
+        // Derive the C-table the way `starts` and `first_` are derived instead
+        // of trusting the blob: c_[s] is the exclusive prefix sum of the BWT
+        // symbol counts, and each count is one wavelet rank at m — at most 258
+        // ranks, the cost class the `starts` check above already pays.
+        c_.resize(sigma_);
+        uint64_t total = 0;
+        for (uint32_t c = 0; c < sigma_; ++c) {
+            c_[c] = total;
+            total += wm_.rank(c, m);
+        }
+        // Every row must hold a symbol below sigma_. qlevels_ spans 2*qlevels_
+        // bits, which for a sigma_ that is not a power of four can represent
+        // ids >= sigma_, and LF() feeds wm_.access(i) straight into c_[sym] /
+        // first_[sym]. A short total is both proof of corruption and the guard
+        // that keeps access() inside those two arrays.
+        if (total != m) {
+            return false;
+        }
+        // The stored table is now redundant; it stays in the format for
+        // compatibility. Treat a mismatch as corruption (same disposition as
+        // `starts`) so a damaged blob is rejected at load rather than answering
+        // queries from a C-table that disagrees with its own wavelet.
+        if (c_ != stored_c) {
+            return false;
+        }
         first_.resize(sigma_);
         for (uint32_t c = 0; c < sigma_; ++c) {
             first_[c] = wm_.map_zero(c);

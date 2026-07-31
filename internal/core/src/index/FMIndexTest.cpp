@@ -410,6 +410,22 @@ TEST(FMIndex, LibraryRejectsCorruptHeaderMetadata) {
     uint64_t corrupt_text_len = uint64_t{1} << 63;
     std::memcpy(blob.data() + 24, &corrupt_text_len, sizeof(corrupt_text_len));
     EXPECT_FALSE(index::fmindex::FMIndex::Deserialize(blob).valid());
+
+    // The C-table starts right after the 256 int32 byte_to_id_ entries
+    // (32 + 1024). parseView derives it from the wavelet instead of trusting
+    // it, so a mutated entry must be rejected at load — otherwise it flows into
+    // `c_[id] - first_[id]`, whose result indexes the rank directory and the
+    // sampled bitmap with no bounds check.
+    blob = built.Serialize();
+    uint32_t sigma = 0;
+    std::memcpy(&sigma, blob.data() + 12, sizeof(sigma));
+    ASSERT_GE(sigma, 3u);
+    const size_t c_off = 1056 + sizeof(uint64_t) * (sigma - 1);
+    uint64_t corrupt_c = 0;
+    std::memcpy(&corrupt_c, blob.data() + c_off, sizeof(corrupt_c));
+    corrupt_c += 4096;  // past the end of the BWT, unreachable rows
+    std::memcpy(blob.data() + c_off, &corrupt_c, sizeof(corrupt_c));
+    EXPECT_FALSE(index::fmindex::FMIndex::Deserialize(blob).valid());
 }
 
 // Load-time validation constrains the sampled-SA array only element-wise (range
