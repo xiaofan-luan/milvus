@@ -456,3 +456,41 @@ func TestSortByMoreThanOneField(t *testing.T) {
 	assert.Equal(t, batchSize*2, gotNumRows)
 	assert.NoError(t, rw.Close())
 }
+
+// MergeSort is the default mix-compaction path (dataNode.compaction.useMergeSort
+// defaults to true and applies once the input segments are sorted), but it had
+// no benchmark. The comparator runs O(log N) times per emitted row, so anything
+// it does per call is multiplied by that.
+func BenchmarkMergeSort(b *testing.B) {
+	const batchSize = 64 * 1024 * 1024
+
+	for _, readers := range []int{2, 8} {
+		b.Run(fmt.Sprintf("%dreaders", readers), func(b *testing.B) {
+			schema := generateTestSchema()
+			rw := &MockRecordWriter{
+				writefn: func(r Record) error { return nil },
+				closefn: func() error { return nil },
+			}
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				rr := make([]RecordReader, readers)
+				for j := range rr {
+					blobs, err := generateTestDataWithSeed(j*5000+1, 5000)
+					if err != nil {
+						b.Fatal(err)
+					}
+					rr[j] = newIterativeCompositeBinlogRecordReader(schema, nil, MakeBlobsReader(blobs))
+				}
+				b.StartTimer()
+
+				if _, err := MergeSort(batchSize, schema, rr, rw,
+					func(r Record, ri, i int) bool { return true },
+					[]int64{common.RowIDField}); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}

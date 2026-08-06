@@ -337,11 +337,57 @@ func MergeSort(batchSize uint64, schema *schemapb.CollectionSchema, rr []RecordR
 		i  int
 	}
 
+	// Sort key columns of each reader's current record, resolved once per record
+	// instead of once per comparison. The comparator runs O(log N) times per
+	// emitted row, and each call used to do two Column() map lookups plus two
+	// type assertions per key. Cf. Sort, which pre-extracts the same way.
+	const (
+		keyInt64 = iota
+		keyString
+	)
+	kinds := make([]int, len(sortedByFieldIDs))
+	int64Keys := make([][][]int64, len(sortedByFieldIDs))
+	stringKeys := make([][]*array.String, len(sortedByFieldIDs))
+	for kp := range sortedByFieldIDs {
+		int64Keys[kp] = make([][]int64, len(rr))
+		stringKeys[kp] = make([]*array.String, len(rr))
+	}
+
 	recs := make([]Record, len(rr))
+
+	// refreshKeys re-resolves the sort key columns for reader ri after its
+	// record has been replaced. Returns an error for unsupported key types.
+	refreshKeys := func(ri int) error {
+		rec := recs[ri]
+		for kp, fid := range sortedByFieldIDs {
+			if rec == nil {
+				int64Keys[kp][ri] = nil
+				stringKeys[kp][ri] = nil
+				continue
+			}
+			switch col := rec.Column(fid).(type) {
+			case *array.Int64:
+				kinds[kp] = keyInt64
+				int64Keys[kp][ri] = col.Int64Values()
+			case *array.String:
+				kinds[kp] = keyString
+				stringKeys[kp][ri] = col
+			default:
+				return merr.WrapErrStorageMsg("unsupported type for sorting key")
+			}
+		}
+		return nil
+	}
+
 	advanceRecord := func(i int) error {
 		rec, err := rr[i].Next()
 		recs[i] = rec // assign nil if err
-		return err
+		if err != nil {
+			// Record is gone; drop the stale key columns with it.
+			_ = refreshKeys(i)
+			return err
+		}
+		return refreshKeys(i)
 	}
 
 	for i := range rr {
@@ -354,46 +400,27 @@ func MergeSort(batchSize uint64, schema *schemapb.CollectionSchema, rr []RecordR
 		}
 	}
 
-	comparators := make([]func(x, y *index) int, 0, len(sortedByFieldIDs))
-	for _, fid := range sortedByFieldIDs {
-		switch recs[0].Column(fid).(type) {
-		case *array.Int64:
-			comparators = append(comparators, func(x, y *index) int {
-				xVal := recs[x.ri].Column(fid).(*array.Int64).Value(x.i)
-				yVal := recs[y.ri].Column(fid).(*array.Int64).Value(y.i)
-				if xVal < yVal {
-					return -1
-				}
-				if xVal > yVal {
-					return 1
-				}
-				return 0
-			})
-		case *array.String:
-			comparators = append(comparators, func(x, y *index) int {
-				xVal := recs[x.ri].Column(fid).(*array.String).Value(x.i)
-				yVal := recs[y.ri].Column(fid).(*array.String).Value(y.i)
-				if xVal < yVal {
-					return -1
-				}
-				if xVal > yVal {
-					return 1
-				}
-				return 0
-			})
-		default:
-			return 0, merr.WrapErrStorageMsg("unsupported type for sorting key")
-		}
-	}
-
 	pq := NewPriorityQueue(func(x, y *index) bool {
-		for _, cmp := range comparators {
-			c := cmp(x, y)
-			if c < 0 {
-				return true
-			}
-			if c > 0 {
-				return false
+		for kp := range sortedByFieldIDs {
+			switch kinds[kp] {
+			case keyInt64:
+				xVal := int64Keys[kp][x.ri][x.i]
+				yVal := int64Keys[kp][y.ri][y.i]
+				if xVal < yVal {
+					return true
+				}
+				if xVal > yVal {
+					return false
+				}
+			case keyString:
+				xVal := stringKeys[kp][x.ri].Value(x.i)
+				yVal := stringKeys[kp][y.ri].Value(y.i)
+				if xVal < yVal {
+					return true
+				}
+				if xVal > yVal {
+					return false
+				}
 			}
 		}
 		if x.ri != y.ri {
