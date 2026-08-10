@@ -87,9 +87,34 @@ type CopySegmentTask struct {
 	manager        TaskManager                         // Task manager for state updates and coordination
 	cm             storage.ChunkManager                // ChunkManager for file copy operations
 
-	// Cleanup tracking: records all successfully copied files for cleanup on failure
-	copiedFilesMu sync.Mutex // Protects copiedFiles for concurrent segment copies
-	copiedFiles   []string   // List of all successfully copied file paths
+	// Cleanup tracking: records all successfully copied files for cleanup on
+	// failure. A POINTER shared by every clone of this task on purpose: the
+	// task manager replaces the stored task with a Clone() on every Update, so
+	// the instance the workers write to and the instance DropCopySegment reads
+	// from are never the same. A per-instance list made the cleanup read an
+	// empty list every time, leaking every partially-copied file.
+	copiedFiles *copiedFileTracker
+}
+
+// copiedFileTracker is the clone-shared record of files written to object
+// storage by this task, kept so a failed task can delete what it wrote.
+type copiedFileTracker struct {
+	mu    sync.Mutex
+	files []string
+}
+
+func (c *copiedFileTracker) add(files []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.files = append(c.files, files...)
+}
+
+func (c *copiedFileTracker) snapshot() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	files := make([]string, len(c.files))
+	copy(files, c.files)
+	return files
 }
 
 // NewCopySegmentTask creates a new copy segment task from a DataCoord request.
@@ -157,6 +182,7 @@ func NewCopySegmentTask(
 	task := &CopySegmentTask{
 		ctx:            ctx,
 		cancel:         cancel,
+		copiedFiles:    &copiedFileTracker{},
 		jobID:          req.GetJobID(),
 		taskID:         req.GetTaskID(),
 		collectionID:   collectionID,
@@ -241,6 +267,7 @@ func (t *CopySegmentTask) Clone() Task {
 	return &CopySegmentTask{
 		ctx:            t.ctx,
 		cancel:         t.cancel,
+		copiedFiles:    t.copiedFiles,
 		jobID:          t.jobID,
 		taskID:         t.taskID,
 		collectionID:   t.collectionID,
@@ -302,16 +329,24 @@ func (t *CopySegmentTask) Execute() []*conc.Future[any] {
 	targets := t.req.GetTargets()
 
 	// Step 2: Validate input
+	// Setup failures flow through a failed future instead of writing Failed
+	// here. The scheduler is the ONLY publisher of terminal states, and it
+	// publishes Completed whenever BlockOnAll returns nil — a worker-written
+	// Failed alongside empty futures was silently overwritten into Completed.
 	if len(sources) == 0 {
 		reason := "no source segments to copy"
-		t.manager.Update(t.GetTaskID(), UpdateState(datapb.ImportTaskStateV2_Failed), UpdateReason(reason))
-		return nil
+		t.manager.Update(t.GetTaskID(), UpdateReason(reason))
+		return []*conc.Future[any]{conc.Go(func() (any, error) {
+			return nil, merr.WrapErrParameterInvalidMsg(reason)
+		})}
 	}
 	if len(sources) != len(targets) {
 		reason := fmt.Sprintf("source segments count (%d) does not match target segments count (%d)",
 			len(sources), len(targets))
-		t.manager.Update(t.GetTaskID(), UpdateState(datapb.ImportTaskStateV2_Failed), UpdateReason(reason))
-		return nil
+		t.manager.Update(t.GetTaskID(), UpdateReason(reason))
+		return []*conc.Future[any]{conc.Go(func() (any, error) {
+			return nil, merr.WrapErrParameterInvalidMsg(reason)
+		})}
 	}
 
 	// Step 3: Submit all segment pairs to execution pool for parallel processing
@@ -380,7 +415,9 @@ func (t *CopySegmentTask) copySingleSegment(source *datapb.CopySegmentSource, ta
 		reason := "no insert/delete binlogs for segment"
 		mlog.Error(t.ctx,
 			reason, logFields...)
-		t.manager.Update(t.GetTaskID(), UpdateState(datapb.ImportTaskStateV2_Failed), UpdateReason(reason))
+		// Record why, but do NOT publish the terminal state here: siblings are
+		// still copying. The scheduler publishes it after BlockOnAll.
+		t.manager.Update(t.GetTaskID(), UpdateReason(reason))
 		return nil, merr.WrapErrParameterInvalidMsg(reason)
 	}
 
@@ -402,7 +439,12 @@ func (t *CopySegmentTask) copySingleSegment(source *datapb.CopySegmentSource, ta
 		reason := fmt.Sprintf("failed to copy segment files: %v", err)
 		mlog.Error(t.ctx,
 			reason, logFields...)
-		t.manager.Update(t.GetTaskID(), UpdateState(datapb.ImportTaskStateV2_Failed), UpdateReason(reason))
+		// Reason only. Publishing Failed from a worker is what let DataCoord
+		// call DropCopySegment while a sibling was still writing: the cleanup
+		// snapshots copiedFiles at that instant, so everything the sibling
+		// wrote afterwards became an orphan no GC can reach, and its writes
+		// raced the delete.
+		t.manager.Update(t.GetTaskID(), UpdateReason(reason))
 		return nil, err
 	}
 
@@ -435,9 +477,7 @@ func (t *CopySegmentTask) copySingleSegment(source *datapb.CopySegmentSource, ta
 // Parameters:
 //   - files: List of successfully copied file paths to record
 func (t *CopySegmentTask) recordCopiedFiles(files []string) {
-	t.copiedFilesMu.Lock()
-	defer t.copiedFilesMu.Unlock()
-	t.copiedFiles = append(t.copiedFiles, files...)
+	t.copiedFiles.add(files)
 }
 
 // CleanupCopiedFiles removes all copied files for failed tasks.
@@ -466,11 +506,9 @@ func (t *CopySegmentTask) recordCopiedFiles(files []string) {
 //   - Safe to call multiple times (operation is idempotent)
 //   - Subsequent calls will attempt to delete same files again
 func (t *CopySegmentTask) CleanupCopiedFiles() {
-	// Step 1: Copy file list under lock (avoid holding lock during I/O)
-	t.copiedFilesMu.Lock()
-	files := make([]string, len(t.copiedFiles))
-	copy(files, t.copiedFiles)
-	t.copiedFilesMu.Unlock()
+	// Step 1: Snapshot the clone-shared file list (avoid holding its lock
+	// during I/O)
+	files := t.copiedFiles.snapshot()
 
 	// Step 2: Early return if no files to cleanup
 	if len(files) == 0 {

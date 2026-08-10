@@ -37,8 +37,10 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/msgpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
+	"github.com/milvus-io/milvus/internal/distributed/streaming"
 	"github.com/milvus-io/milvus/internal/flushcommon/syncmgr"
 	"github.com/milvus-io/milvus/internal/mocks"
+	"github.com/milvus-io/milvus/internal/mocks/distributed/mock_streaming"
 	"github.com/milvus-io/milvus/internal/mocks/util/mock_segcore"
 	"github.com/milvus-io/milvus/internal/querynodev2/cluster"
 	"github.com/milvus-io/milvus/internal/querynodev2/delegator/deletebuffer"
@@ -1901,7 +1903,12 @@ func (s *DelegatorDataSuite) TestReleaseSegmentsWorkerNotAvailable() {
 	}
 }
 
-func (s *DelegatorDataSuite) TestReleaseGrowingSourceAfterPreparedHandoff() {
+// Releasing a growing segment on a growing-source-enabled channel is a plain
+// release now that the handoff-prepare step is gone: the delegator drops it from
+// its distribution, excludes it from the pipeline up to the checkpoint, and
+// forwards the release to the worker (which owns removing it from the segment
+// manager — mocked here, so asserted via the forwarded request).
+func (s *DelegatorDataSuite) TestReleaseGrowingSourceSegment() {
 	ctx := context.Background()
 	s.workerManager = &cluster.MockManager{}
 	s.manager = segments.NewManager()
@@ -1930,7 +1937,7 @@ func (s *DelegatorDataSuite) TestReleaseGrowingSourceAfterPreparedHandoff() {
 	const (
 		segmentID    = int64(1001)
 		partitionID  = int64(500)
-		targetOffset = int64(10)
+		checkpointTs = uint64(10000)
 	)
 
 	segment := segments.NewMockSegment(s.T())
@@ -1941,10 +1948,6 @@ func (s *DelegatorDataSuite) TestReleaseGrowingSourceAfterPreparedHandoff() {
 	segment.EXPECT().Partition().Return(partitionID).Maybe()
 	segment.EXPECT().Type().Return(segments.SegmentTypeGrowing).Maybe()
 	segment.EXPECT().Level().Return(datapb.SegmentLevel_Legacy).Maybe()
-	segment.EXPECT().PinIfNotReleased().Return(nil).Once()
-	segment.EXPECT().InsertCount().Return(targetOffset).Once()
-	segment.EXPECT().MemSize().Return(int64(1024)).Once()
-	segment.EXPECT().Unpin().Maybe()
 
 	s.manager.Segment.Put(ctx, segments.SegmentTypeGrowing, segment)
 	sd.distribution.AddGrowing(SegmentEntry{
@@ -1953,17 +1956,15 @@ func (s *DelegatorDataSuite) TestReleaseGrowingSourceAfterPreparedHandoff() {
 		PartitionID: partitionID,
 		Version:     1,
 	})
-	worker := &cluster.MockWorker{}
-	worker.EXPECT().ReleaseSegments(mock.Anything, mock.AnythingOfType("*querypb.ReleaseSegmentsRequest")).Return(nil).Once()
-	s.workerManager.EXPECT().GetWorker(mock.Anything, paramtable.GetNodeID()).Return(worker, nil).Once()
+	_, growing := sd.distribution.PeekSegments(false)
+	s.Require().Len(growing, 1)
 
-	err = sd.growingSourceProvider.PrepareGrowingSourceReleaseHandoff(ctx, 10000, []syncmgr.GrowingSourceReleaseHandoffSegment{
-		{
-			SegmentID:    segmentID,
-			TargetOffset: targetOffset,
-		},
-	})
-	s.Require().NoError(err)
+	worker := &cluster.MockWorker{}
+	worker.EXPECT().ReleaseSegments(mock.Anything, mock.MatchedBy(func(req *querypb.ReleaseSegmentsRequest) bool {
+		return len(req.GetSegmentIDs()) == 1 && req.GetSegmentIDs()[0] == segmentID &&
+			req.GetScope() == querypb.DataScope_Streaming
+	})).Return(nil).Once()
+	s.workerManager.EXPECT().GetWorker(mock.Anything, paramtable.GetNodeID()).Return(worker, nil).Once()
 
 	err = sd.ReleaseSegments(ctx, &querypb.ReleaseSegmentsRequest{
 		Base:         commonpbutil.NewMsgBase(),
@@ -1972,11 +1973,27 @@ func (s *DelegatorDataSuite) TestReleaseGrowingSourceAfterPreparedHandoff() {
 		SegmentIDs:   []int64{segmentID},
 		Scope:        querypb.DataScope_Streaming,
 		Shard:        s.vchannelName,
+		Checkpoint:   &msgpb.MsgPosition{Timestamp: checkpointTs},
 	}, false)
 	s.Require().NoError(err)
+
+	// Distribution no longer serves the growing segment.
+	_, growing = sd.distribution.PeekSegments(false)
+	s.Empty(growing, "released growing segment must leave the distribution")
+	// The pipeline must not re-consume it up to the checkpoint.
+	s.False(sd.excludedSegments.Verify(segmentID, checkpointTs),
+		"released growing segment must be excluded up to the release checkpoint")
+	// And the insert path is not left holding the growing segment lock.
+	s.True(sd.growingSegmentLock.TryLock())
+	sd.growingSegmentLock.Unlock()
 }
 
-func (s *DelegatorDataSuite) TestReleaseGrowingSourceAfterFencePreparedHandoff() {
+// A partial release of a growing segment must be refused while the local write
+// buffer still owes a growing-source flush for it, and refused BEFORE anything
+// is torn down: excluding the segment from the pipeline would stop it ingesting
+// rows the write buffer still expects to pull from it, which is worse than the
+// removal itself.
+func (s *DelegatorDataSuite) TestReleaseGrowingSourceSegmentRefusedWhileFlushOwed() {
 	ctx := context.Background()
 	s.workerManager = &cluster.MockManager{}
 	s.manager = segments.NewManager()
@@ -1984,11 +2001,12 @@ func (s *DelegatorDataSuite) TestReleaseGrowingSourceAfterFencePreparedHandoff()
 	s.genTextCollection()
 	s.enableGrowingSourceFlush()
 
+	vchannel := s.vchannelName
 	delegator, err := NewShardDelegator(
 		ctx,
 		s.collectionID,
 		s.replicaID,
-		s.vchannelName,
+		vchannel,
 		s.version,
 		s.workerManager,
 		s.manager,
@@ -2002,35 +2020,76 @@ func (s *DelegatorDataSuite) TestReleaseGrowingSourceAfterFencePreparedHandoff()
 	sd := delegator.(*shardDelegator)
 	defer sd.Close()
 
-	const segmentID = int64(1001)
+	const (
+		segmentID    = int64(2001)
+		partitionID  = int64(500)
+		checkpointTs = uint64(10000)
+	)
+
+	segment := segments.NewMockSegment(s.T())
+	segment.EXPECT().ID().Return(segmentID).Maybe()
+	segment.EXPECT().Version().Return(int64(1)).Maybe()
+	segment.EXPECT().Shard().Return(s.channel).Maybe()
+	segment.EXPECT().Collection().Return(s.collectionID).Maybe()
+	segment.EXPECT().Partition().Return(partitionID).Maybe()
+	segment.EXPECT().Type().Return(segments.SegmentTypeGrowing).Maybe()
+	segment.EXPECT().Level().Return(datapb.SegmentLevel_Legacy).Maybe()
+	s.manager.Segment.Put(ctx, segments.SegmentTypeGrowing, segment)
 	sd.distribution.AddGrowing(SegmentEntry{
 		NodeID:      paramtable.GetNodeID(),
 		SegmentID:   segmentID,
-		PartitionID: 500,
+		PartitionID: partitionID,
 		Version:     1,
 	})
 
-	err = sd.growingSourceProvider.PrepareGrowingSourceReleaseHandoff(ctx, 10000, []syncmgr.GrowingSourceReleaseHandoffSegment{
-		{SegmentID: segmentID},
-	})
-	s.Require().NoError(err)
-	worker := &cluster.MockWorker{}
-	worker.EXPECT().ReleaseSegments(mock.Anything, mock.AnythingOfType("*querypb.ReleaseSegmentsRequest")).Return(nil).Once()
-	s.workerManager.EXPECT().GetWorker(mock.Anything, paramtable.GetNodeID()).Return(worker, nil).Once()
+	// The channel uses growing-source flush, and the local write buffer still
+	// owes a flush for this segment.
+	registration := syncmgr.DefaultGrowingSourceRegistry().Register(vchannel, releaseGuardStubProvider{})
+	defer syncmgr.DefaultGrowingSourceRegistry().Unregister(registration)
 
+	wal := mock_streaming.NewMockWALAccesser(s.T())
+	local := mock_streaming.NewMockLocal(s.T())
+	local.EXPECT().PrepareReleaseSegmentsIfLocal(mock.Anything, s.collectionID, vchannel, []int64{segmentID}).
+		Return(true, nil).Once()
+	wal.EXPECT().Local().Return(local).Maybe()
+	previousWAL := streaming.WAL()
+	streaming.SetWALForTest(wal)
+	defer streaming.SetWALForTest(previousWAL)
+
+	// GetWorker intentionally has no expectation: the release must be refused
+	// before the delegator forwards anything.
 	err = sd.ReleaseSegments(ctx, &querypb.ReleaseSegmentsRequest{
 		Base:         commonpbutil.NewMsgBase(),
 		NodeID:       paramtable.GetNodeID(),
 		CollectionID: s.collectionID,
 		SegmentIDs:   []int64{segmentID},
 		Scope:        querypb.DataScope_Streaming,
-		Shard:        s.vchannelName,
-		Checkpoint:   &msgpb.MsgPosition{Timestamp: 10000},
+		Shard:        vchannel,
+		Checkpoint:   &msgpb.MsgPosition{Timestamp: checkpointTs},
 	}, false)
-	s.Require().NoError(err)
+	s.Error(err, "release must be refused while a growing-source flush is still owed")
+
+	_, growing := sd.distribution.PeekSegments(false)
+	s.Len(growing, 1, "refused release must not remove the growing segment from the distribution")
+	s.True(sd.excludedSegments.Verify(segmentID, checkpointTs),
+		"refused release must not exclude the segment from the pipeline")
+	s.True(sd.growingSegmentLock.TryLock())
+	sd.growingSegmentLock.Unlock()
 }
 
-func (s *DelegatorDataSuite) TestReleaseGrowingSourceAfterNoRetainPreparedHandoff() {
+// releaseGuardStubProvider marks a channel as growing-source enabled in the
+// process-global registry without providing usable sources.
+type releaseGuardStubProvider struct{}
+
+func (releaseGuardStubProvider) GetGrowingFlushSource(int64, *msgpb.MsgPosition) (syncmgr.GrowingFlushSource, syncmgr.GrowingSourceState) {
+	return nil, syncmgr.GrowingSourceUnavailable
+}
+
+// The provider's lifetime is wired to the delegator's: built at construction but
+// published only by Start (once the watch has fully succeeded), and withdrawn by
+// Close. A provider reachable outside that window commits segments to a source
+// that will never exist.
+func (s *DelegatorDataSuite) TestGrowingSourceProviderLifecycleWiring() {
 	ctx := context.Background()
 	s.workerManager = &cluster.MockManager{}
 	s.manager = segments.NewManager()
@@ -2038,11 +2097,17 @@ func (s *DelegatorDataSuite) TestReleaseGrowingSourceAfterNoRetainPreparedHandof
 	s.genTextCollection()
 	s.enableGrowingSourceFlush()
 
+	// Unique channel name so a failure here can never leak state into other
+	// tests through the process-global registry.
+	vchannel := fmt.Sprintf("%s_lifecycle_%d", s.vchannelName, time.Now().UnixNano())
+	registry := syncmgr.DefaultGrowingSourceRegistry()
+	s.Require().Zero(registry.ProviderCount(vchannel))
+
 	delegator, err := NewShardDelegator(
 		ctx,
 		s.collectionID,
 		s.replicaID,
-		s.vchannelName,
+		vchannel,
 		s.version,
 		s.workerManager,
 		s.manager,
@@ -2054,35 +2119,28 @@ func (s *DelegatorDataSuite) TestReleaseGrowingSourceAfterNoRetainPreparedHandof
 		nil)
 	s.Require().NoError(err)
 	sd := delegator.(*shardDelegator)
-	defer sd.Close()
+	// Whatever fails below, never leak a registration into the global registry.
+	defer func() {
+		if sd.growingSourceProvider != nil {
+			sd.growingSourceProvider.Deactivate()
+		}
+	}()
+	closed := false
+	defer func() {
+		if !closed {
+			sd.Close()
+		}
+	}()
 
-	const segmentID = int64(1001)
-	sd.distribution.AddGrowing(SegmentEntry{
-		NodeID:      paramtable.GetNodeID(),
-		SegmentID:   segmentID,
-		PartitionID: 500,
-		Version:     1,
-	})
+	s.Require().NotNil(sd.growingSourceProvider, "growing-source flush is enabled, the provider must be built")
+	s.Zero(registry.ProviderCount(vchannel), "provider must not be published before Start")
 
-	err = sd.growingSourceProvider.PrepareGrowingSourceReleaseHandoff(ctx, 10000, []syncmgr.GrowingSourceReleaseHandoffSegment{
-		{SegmentID: segmentID},
-	})
-	s.Require().NoError(err)
+	sd.Start()
+	s.Equal(1, registry.ProviderCount(vchannel), "Start must publish exactly one provider")
 
-	worker := &cluster.MockWorker{}
-	worker.EXPECT().ReleaseSegments(mock.Anything, mock.AnythingOfType("*querypb.ReleaseSegmentsRequest")).Return(nil).Once()
-	s.workerManager.EXPECT().GetWorker(mock.Anything, paramtable.GetNodeID()).Return(worker, nil).Once()
-
-	err = sd.ReleaseSegments(ctx, &querypb.ReleaseSegmentsRequest{
-		Base:         commonpbutil.NewMsgBase(),
-		NodeID:       paramtable.GetNodeID(),
-		CollectionID: s.collectionID,
-		SegmentIDs:   []int64{segmentID},
-		Scope:        querypb.DataScope_Streaming,
-		Shard:        s.vchannelName,
-		Checkpoint:   &msgpb.MsgPosition{Timestamp: 10000},
-	}, false)
-	s.Require().NoError(err)
+	sd.Close()
+	closed = true
+	s.Zero(registry.ProviderCount(vchannel), "Close must withdraw the provider")
 }
 
 func (s *DelegatorDataSuite) TestReleaseGrowingSourceWithoutPreparedHandoff() {

@@ -17,6 +17,7 @@
 package importv2
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"testing"
@@ -137,12 +138,21 @@ func TestCopySegmentTaskExecute(t *testing.T) {
 		task := NewCopySegmentTask(req, mockManager, mockCM)
 		mockManager.Add(task)
 
+		// Setup failures flow through a FAILED FUTURE, not a worker-written
+		// state: the scheduler is the only terminal-state publisher, and it
+		// publishes Completed whenever BlockOnAll returns nil — so an empty
+		// future list here used to turn this validation failure into Completed.
 		futures := task.Execute()
-		assert.Nil(t, futures)
+		assert.Len(t, futures, 1)
+		err := conc.BlockOnAll(futures...)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "no source segments")
 
-		// Verify task state is Failed
+		// The worker records only the reason; the state must stay exactly
+		// InProgress (set at Execute start) — the scheduler is the sole
+		// terminal-state publisher.
 		updatedTask := mockManager.Get(task.GetTaskID())
-		assert.Equal(t, datapb.ImportTaskStateV2_Failed, updatedTask.GetState())
+		assert.Equal(t, datapb.ImportTaskStateV2_InProgress, updatedTask.GetState())
 		assert.Contains(t, updatedTask.GetReason(), "no source segments")
 	})
 
@@ -163,11 +173,15 @@ func TestCopySegmentTaskExecute(t *testing.T) {
 		mockManager.Add(task)
 
 		futures := task.Execute()
-		assert.Nil(t, futures)
+		assert.Len(t, futures, 1)
+		err := conc.BlockOnAll(futures...)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "does not match")
 
-		// Verify task state is Failed
+		// Same contract: the worker records the reason but leaves the state at
+		// the InProgress it set on entry; only the scheduler publishes terminal.
 		updatedTask := mockManager.Get(task.GetTaskID())
-		assert.Equal(t, datapb.ImportTaskStateV2_Failed, updatedTask.GetState())
+		assert.Equal(t, datapb.ImportTaskStateV2_InProgress, updatedTask.GetState())
 		assert.Contains(t, updatedTask.GetReason(), "does not match")
 	})
 
@@ -1079,24 +1093,18 @@ func TestCopySegmentTask_RecordCopiedFiles(t *testing.T) {
 		task.recordCopiedFiles(files1)
 		task.recordCopiedFiles(files2)
 
-		task.copiedFilesMu.Lock()
-		defer task.copiedFilesMu.Unlock()
-
-		assert.Len(t, task.copiedFiles, 4)
-		assert.Contains(t, task.copiedFiles, "10001")
-		assert.Contains(t, task.copiedFiles, "10002")
-		assert.Contains(t, task.copiedFiles, "10003")
-		assert.Contains(t, task.copiedFiles, "10004")
+		assert.Len(t, task.copiedFiles.snapshot(), 4)
+		assert.Contains(t, task.copiedFiles.snapshot(), "10001")
+		assert.Contains(t, task.copiedFiles.snapshot(), "10002")
+		assert.Contains(t, task.copiedFiles.snapshot(), "10003")
+		assert.Contains(t, task.copiedFiles.snapshot(), "10004")
 	})
 
 	t.Run("record empty files", func(t *testing.T) {
 		newTask := NewCopySegmentTask(req, mockManager, cm).(*CopySegmentTask)
 		newTask.recordCopiedFiles([]string{})
 
-		newTask.copiedFilesMu.Lock()
-		defer newTask.copiedFilesMu.Unlock()
-
-		assert.Empty(t, newTask.copiedFiles)
+		assert.Empty(t, newTask.copiedFiles.snapshot())
 	})
 
 	t.Run("concurrent recording", func(t *testing.T) {
@@ -1115,10 +1123,7 @@ func TestCopySegmentTask_RecordCopiedFiles(t *testing.T) {
 
 		wg.Wait()
 
-		newTask.copiedFilesMu.Lock()
-		defer newTask.copiedFilesMu.Unlock()
-
-		assert.Len(t, newTask.copiedFiles, 10)
+		assert.Len(t, newTask.copiedFiles.snapshot(), 10)
 	})
 }
 
@@ -1300,10 +1305,8 @@ func TestCopySegmentTask_CopySingleSegment_WithCleanup(t *testing.T) {
 		assert.NoError(t, err)
 
 		// Verify files were recorded
-		task.copiedFilesMu.Lock()
-		defer task.copiedFilesMu.Unlock()
-		assert.Len(t, task.copiedFiles, 1)
-		assert.Contains(t, task.copiedFiles, "files/insert_log/444/555/666/1/10001")
+		assert.Len(t, task.copiedFiles.snapshot(), 1)
+		assert.Contains(t, task.copiedFiles.snapshot(), "files/insert_log/444/555/666/1/10001")
 	})
 
 	t.Run("records partial files on failure", func(t *testing.T) {
@@ -1345,8 +1348,93 @@ func TestCopySegmentTask_CopySingleSegment_WithCleanup(t *testing.T) {
 		assert.Error(t, err)
 
 		// Verify partial files were still recorded
-		task.copiedFilesMu.Lock()
-		defer task.copiedFilesMu.Unlock()
-		assert.True(t, len(task.copiedFiles) <= 1, "should record file copied before failure")
+		assert.True(t, len(task.copiedFiles.snapshot()) <= 1, "should record file copied before failure")
 	})
+}
+
+// Regression: the task manager replaces its stored task with a Clone on every
+// Update, while workers keep the instance captured at Execute time. The cleanup
+// tracker must therefore be SHARED across clones — a per-instance list made
+// DropCopySegment read an empty list every time, leaking every
+// partially-copied file.
+func TestCopySegmentTaskCopiedFilesSurviveClone(t *testing.T) {
+	cm := mocks.NewChunkManager(t)
+	req := &datapb.CopySegmentRequest{
+		JobID:  100,
+		TaskID: 9100,
+		Sources: []*datapb.CopySegmentSource{
+			{CollectionId: 111, PartitionId: 222, SegmentId: 333},
+		},
+		Targets: []*datapb.CopySegmentTarget{
+			{CollectionId: 444, PartitionId: 555, SegmentId: 666},
+		},
+	}
+	manager := NewTaskManager()
+	worker := NewCopySegmentTask(req, manager, cm).(*CopySegmentTask)
+	manager.Add(worker)
+
+	// The clone chain the manager builds on every Update.
+	manager.Update(worker.GetTaskID(), UpdateState(datapb.ImportTaskStateV2_InProgress))
+	manager.Update(worker.GetTaskID(), UpdateReason("copy failed"))
+
+	// The worker records on ITS instance, not the manager's latest clone.
+	worker.recordCopiedFiles([]string{"files/insert_log/444/555/666/1/1"})
+
+	got := manager.Get(worker.GetTaskID()).(*CopySegmentTask).copiedFiles.snapshot()
+	assert.Equal(t, []string{"files/insert_log/444/555/666/1/1"}, got,
+		"cleanup must see files recorded by the worker's instance")
+}
+
+// Regression: Remove() cancels the manager's stored clone. With a child context
+// per clone, that cancellation never reached the worker's instance, so a
+// dropped import kept reading, writing and retrying forever. ctx/cancel must be
+// lifecycle objects shared by every clone.
+func TestImportTaskCancelPropagatesAcrossClones(t *testing.T) {
+	for name, task := range map[string]Task{
+		"import": &ImportTask{
+			ImportTaskV2: &datapb.ImportTaskV2{TaskID: 9200},
+			req:          &datapb.ImportRequest{},
+		},
+		"l0_import": &L0ImportTask{
+			ImportTaskV2: &datapb.ImportTaskV2{TaskID: 9201},
+			req:          &datapb.ImportRequest{},
+		},
+		"preimport": &PreImportTask{
+			PreImportTask: &datapb.PreImportTask{TaskID: 9202},
+			req:           &datapb.PreImportRequest{},
+		},
+		"l0_preimport": &L0PreImportTask{
+			PreImportTask: &datapb.PreImportTask{TaskID: 9203},
+			req:           &datapb.PreImportRequest{},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			// Remove() is what must call cancel; the deferred call only
+			// silences vet and is idempotent.
+			defer cancel()
+			switch v := task.(type) {
+			case *ImportTask:
+				v.ctx, v.cancel = ctx, cancel
+			case *L0ImportTask:
+				v.ctx, v.cancel = ctx, cancel
+			case *PreImportTask:
+				v.ctx, v.cancel = ctx, cancel
+			case *L0PreImportTask:
+				v.ctx, v.cancel = ctx, cancel
+			}
+
+			manager := NewTaskManager()
+			manager.Add(task)
+			// Two updates → the manager now holds a clone of a clone.
+			manager.Update(task.GetTaskID(), UpdateState(datapb.ImportTaskStateV2_InProgress))
+			manager.Update(task.GetTaskID(), UpdateReason("x"))
+
+			// Remove cancels the manager's instance; the WORKER's ctx (the
+			// original) must observe it.
+			manager.Remove(task.GetTaskID())
+			assert.Error(t, ctx.Err(),
+				"cancel must reach the instance the workers captured")
+		})
+	}
 }

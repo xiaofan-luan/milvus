@@ -12,6 +12,7 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/flushcommon/metacache"
 	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v3/util/tsoutil"
 )
@@ -83,14 +84,37 @@ func (s *SyncPolicySuite) TestSyncDroppedPolicy() {
 }
 
 func (s *SyncPolicySuite) TestSealedSegmentsPolicy() {
-	metacache := metacache.NewMockMetaCache(s.T())
-	policy := GetSealedSegmentsPolicy(metacache)
-	ids := []int64{1, 2, 3}
-	metacache.EXPECT().GetSegmentIDsBy(mock.Anything).Return(ids)
-	metacache.EXPECT().UpdateSegments(mock.Anything, mock.Anything, mock.Anything).Return()
+	mc := metacache.NewMockMetaCache(s.T())
+	policy := GetSealedSegmentsPolicy(mc)
+	claimed := []int64{7, 8}
+	due := []int64{1, 2, 3}
+	// A matcher that accepts only a state filter selecting exactly `state` among
+	// the two states this policy queries — so swapping the Flushing and Sealed
+	// queries fails the test instead of silently matching mock.Anything.
+	matchesOnlyState := func(state commonpb.SegmentState) interface{} {
+		return mock.MatchedBy(func(filter metacache.SegmentFilter) bool {
+			for _, candidate := range []commonpb.SegmentState{commonpb.SegmentState_Flushing, commonpb.SegmentState_Sealed} {
+				info := metacache.NewSegmentInfo(&datapb.SegmentInfo{ID: 1, State: candidate}, nil, nil, nil)
+				if filter.Filter(info) != (candidate == state) {
+					return false
+				}
+			}
+			return true
+		})
+	}
+	// Two queries, in this order: already-claimed flushes (Flushing), then the
+	// ones still waiting to be claimed (Sealed).
+	mc.EXPECT().GetSegmentIDsBy(matchesOnlyState(commonpb.SegmentState_Flushing)).Return(claimed).Once()
+	mc.EXPECT().GetSegmentIDsBy(matchesOnlyState(commonpb.SegmentState_Sealed)).Return(due).Once()
+	// Deliberately no UpdateSegments expectation: the policy must NOT claim.
+	// Claiming here would be claiming before knowing whether the flush can be
+	// produced, which is what forced the old Flushing->Sealed rollback. The mock
+	// fails the test if the policy touches segment state.
 
 	result := policy.SelectSegments([]*segmentBuffer{}, tsoutil.ComposeTSByTime(time.Now()))
-	s.ElementsMatch(ids, result)
+	// Order, not just membership: the claim is one-way now, so this ordering is
+	// what finishes a claimed flush before starting a new one.
+	s.Equal([]int64{7, 8, 1, 2, 3}, result)
 }
 
 func (s *SyncPolicySuite) TestOlderBufferPolicy() {
