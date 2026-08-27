@@ -141,6 +141,13 @@ func (w *roWALAdaptorImpl) Available() <-chan struct{} {
 	return w.availableCtx.Done()
 }
 
+// markUnavailable rejects new operations without closing the WAL from the
+// failing background task. The owner remains responsible for closing it.
+func (w *roWALAdaptorImpl) markUnavailable(err error) {
+	w.Logger().Error(context.TODO(), "wal is unavailable because a background task failed", mlog.Err(err))
+	w.availableCancel()
+}
+
 // Close overrides Scanner Close function.
 func (w *roWALAdaptorImpl) Close() {
 	// begin to close the wal.

@@ -21,8 +21,9 @@ import (
 var singleton WALAccesser = nil
 
 var (
-	ErrWALReleaseTimeout = errors.New("wal release timeout")
-	releaseTimeout       = 5 * time.Second
+	ErrWALReleaseTimeout        = errors.New("wal release timeout")
+	releaseTimeout              = 5 * time.Second
+	errStreamingVersionObserved = errors.New("streaming version observed")
 )
 
 // Init initializes the wal accesser with the given etcd client.
@@ -78,6 +79,21 @@ func ResolvePChannelInfo(ctx context.Context, vchannel string) (types.PChannelIn
 		return types.PChannelInfo{}, status.NewUnrecoverableError("wal accesser does not support pchannel assignment discovery")
 	}
 	return resolver.ResolvePChannelInfo(ctx, vchannel)
+}
+
+type streamingVersionChecker interface {
+	checkStreamingVersion(ctx context.Context, minimumVersion int64) error
+}
+
+// CheckStreamingVersion checks the latest assignment snapshot without waiting.
+// StreamingNode uses it to keep irreversible WAL format features dormant until
+// StreamingCoord has persisted the cluster capability.
+func CheckStreamingVersion(ctx context.Context, minimumVersion int64) error {
+	checker, ok := singleton.(streamingVersionChecker)
+	if !ok {
+		return status.NewUnrecoverableError("wal accesser does not support streaming version discovery")
+	}
+	return checker.checkStreamingVersion(ctx, minimumVersion)
 }
 
 // AppendOption is the option for append operation.

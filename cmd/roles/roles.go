@@ -228,6 +228,12 @@ func (mr *MilvusRoles) resolveFileResourceMode() fileresource.Mode {
 	return fileresource.ResolveMode(modes...)
 }
 
+func (mr *MilvusRoles) shouldInitStreaming() bool {
+	return mr.ServerType == typeutil.StandaloneRole ||
+		!mr.EnableDataNode ||
+		mr.EnableStreamingNode
+}
+
 // waitForAllComponentsReady waits for all components to be ready.
 // It will return an error if any component is not ready before closing with a fast fail strategy.
 // It will return a map of components that are ready.
@@ -488,8 +494,10 @@ func (mr *MilvusRoles) Run() {
 	}
 
 	// Initialize streaming service if enabled.
-	if mr.ServerType == typeutil.StandaloneRole || !mr.EnableDataNode {
-		// only datanode does not init streaming service
+	if mr.shouldInitStreaming() {
+		// Preserve the existing DataNode-bearing mixture behavior unless the
+		// process also hosts a StreamingNode: its WAL chunking gate observes the
+		// persisted StreamingVersion through this client.
 		streaming.Init()
 		defer func() {
 			if err := streaming.Release(); err != nil {

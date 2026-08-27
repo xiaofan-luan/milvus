@@ -22,10 +22,6 @@ dispatch work. This package owns that lookup.
    collection cache. The injected resolver owns caching (e.g. it reads the meta
    cache), so this package never serves stale channel metadata and never needs
    its own invalidation path.
-3. **Message packing helpers**: `GenInsertMsgsByPartition` splits an insert
-   payload into per-segment messages honoring the WAL-specific single-row limit;
-   `GetActiveWALName` returns the active WAL implementation name.
-
 ## Architecture
 
 ```

@@ -135,6 +135,7 @@ type scannerAdaptorImpl struct {
 	clearOnce       sync.Once
 	metrics         *metricsutil.ScannerMetrics
 	readRateCounter *utility.AverageRateCounter // tracks read rate (bytes/sec)
+	chunkAssembler  message.ChunkAssembler      // reassembles chunked payloads split at the WAL-impl layer.
 }
 
 // Channel returns the channel assignment info of the wal.
@@ -167,9 +168,10 @@ func (s *scannerAdaptorImpl) clear() {
 }
 
 func (s *scannerAdaptorImpl) execute() {
+	var finalErr error
 	defer func() {
 		s.readOption.MesasgeHandler.Close()
-		s.Finish(nil)
+		s.Finish(finalErr)
 		s.logger.Info(context.TODO(), "scanner is closed")
 	}()
 	s.logger.Info(context.TODO(), "scanner start background task")
@@ -177,7 +179,10 @@ func (s *scannerAdaptorImpl) execute() {
 	msgChan := make(chan message.ImmutableMessage)
 
 	ch := make(chan struct{})
-	defer func() { <-ch }()
+	defer func() {
+		s.Cancel()
+		<-ch
+	}()
 	// TODO: optimize the extra goroutine here after msgstream is removed.
 	go func() {
 		defer close(ch)
@@ -194,6 +199,7 @@ func (s *scannerAdaptorImpl) execute() {
 		s.logger.Info(context.TODO(), "the consuming event loop of scanner is closed")
 		return
 	}
+	finalErr = err
 	s.logger.Warn(context.TODO(), "the consuming event loop of scanner is closed with unexpected error", mlog.Err(err))
 }
 
@@ -265,7 +271,9 @@ func (s *scannerAdaptorImpl) consumeEventLoop(msgChan <-chan message.ImmutableMe
 			s.metrics.UpdatePendingQueueSize(s.pendingQueue.Bytes())
 		}
 		if handleResult.Incoming != nil {
-			s.handleUpstream(handleResult.Incoming)
+			if err := s.handleUpstream(handleResult.Incoming); err != nil {
+				return err
+			}
 		}
 	}
 }
@@ -335,11 +343,22 @@ func (c *slowdownCheckerImpl) SlowdownStartupHWM() int64 {
 }
 
 // handleUpstream handles the incoming message from the upstream.
-func (s *scannerAdaptorImpl) handleUpstream(msg message.ImmutableMessage) {
+func (s *scannerAdaptorImpl) handleUpstream(msg message.ImmutableMessage) error {
+	// Reassemble a chunked payload (split at the WAL-impl layer) before any
+	// message-type or body parsing, since a chunk is not itself a valid body.
+	if assembled, handled, err := s.chunkAssembler.Push(msg); err != nil {
+		return err
+	} else if handled {
+		if assembled == nil {
+			return nil
+		}
+		msg = assembled
+	}
+
 	// Filtering the message if needed.
 	// System message should never be filtered.
 	if s.filterFunc != nil && !s.filterFunc(msg) {
-		return
+		return nil
 	}
 
 	// Track read rate for rate limiting control.
@@ -381,14 +400,14 @@ func (s *scannerAdaptorImpl) handleUpstream(msg message.ImmutableMessage) {
 			s.pendingQueue.Add([]message.ImmutableMessage{msg})
 		}
 		s.metrics.UpdatePendingQueueSize(s.pendingQueue.Bytes())
-		return
+		return nil
 	}
 
 	// Filtering the vchannel
 	// If the message is not belong to any vchannel, it should be broadcasted to all vchannels.
 	// Otherwise, it should be filtered by vchannel.
 	if msg.VChannel() != "" && s.readOption.VChannel != "" && s.readOption.VChannel != msg.VChannel() {
-		return
+		return nil
 	}
 	// otherwise add message into reorder buffer directly.
 	if err := s.reorderBuffer.Push(msg); err != nil {
@@ -403,4 +422,5 @@ func (s *scannerAdaptorImpl) handleUpstream(msg message.ImmutableMessage) {
 	// Observe the filtered message.
 	s.metrics.UpdateTimeTickBufSize(s.reorderBuffer.Bytes())
 	s.metrics.ObservePassedMessage(isTailing, msg.MessageType(), msg.EstimateSize())
+	return nil
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 
+	"github.com/cockroachdb/errors"
 	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"github.com/milvus-io/milvus/internal/distributed/streaming/internal/consumer"
@@ -150,6 +151,28 @@ func (w *walAccesserImpl) ResolvePChannelInfo(ctx context.Context, vchannel stri
 		}
 	}
 	return types.PChannelInfo{}, status.NewChannelNotExist(pchannel)
+}
+
+func (w *walAccesserImpl) checkStreamingVersion(ctx context.Context, minimumVersion int64) error {
+	var currentVersion int64
+	err := w.streamingCoordClient.Assignment().AssignmentDiscover(ctx, func(assignments *types.VersionedStreamingNodeAssignments) error {
+		currentVersion = assignments.StreamingVersion.GetVersion()
+		return errStreamingVersionObserved
+	})
+	if !errors.Is(err, errStreamingVersionObserved) {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return status.NewUnrecoverableError("failed to check streaming version: %v", err)
+	}
+	if currentVersion < minimumVersion {
+		return status.NewUnrecoverableError(
+			"WAL payload chunking is not ready: streaming version %d is required, current version is %d; retry after the rolling upgrade completes",
+			minimumVersion,
+			currentVersion,
+		)
+	}
+	return nil
 }
 
 // Broadcast returns a broadcast for broadcasting records to the wal.

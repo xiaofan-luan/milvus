@@ -11,6 +11,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/atomic"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
@@ -422,6 +423,123 @@ func TestBalancerWaitUntilSchemaDropReadySkipsAfterPersistedVersion(t *testing.T
 	assert.NoError(t, b.WaitUntilSchemaDropReady(waitCtx))
 }
 
+func TestBalancerActivatesChunkingAfterAllPrerequisitesAreReady(t *testing.T) {
+	paramtable.Init()
+	oldRootPath := paramtable.Get().EtcdCfg.RootPath.SwapTempValue(fmt.Sprintf("chunking-ready-%d", time.Now().UnixNano()))
+	oldMetaSubPath := paramtable.Get().EtcdCfg.MetaSubPath.SwapTempValue("meta")
+	oldTriggerInterval := paramtable.Get().StreamingCfg.WALBalancerTriggerInterval.SwapTempValue("10ms")
+	defer paramtable.Get().EtcdCfg.RootPath.SwapTempValue(oldRootPath)
+	defer paramtable.Get().EtcdCfg.MetaSubPath.SwapTempValue(oldMetaSubPath)
+	defer paramtable.Get().StreamingCfg.WALBalancerTriggerInterval.SwapTempValue(oldTriggerInterval)
+	metaRoot := paramtable.Get().EtcdCfg.MetaRootPath.GetValue()
+
+	etcdClient, _ := kvfactory.GetEtcdAndPath()
+	channel.ResetStaticPChannelStatsManager()
+	channel.RecoverPChannelStatsManager([]string{})
+
+	newManagerClient := func(t *testing.T) *mock_manager.MockManagerClient {
+		manager := mock_manager.NewMockManagerClient(t)
+		manager.EXPECT().WatchNodeChanged(mock.Anything).Return(make(chan struct{}), nil).Maybe()
+		manager.EXPECT().Assign(mock.Anything, mock.Anything).Return(nil).Maybe()
+		manager.EXPECT().Remove(mock.Anything, mock.Anything).Return(nil).Maybe()
+		manager.EXPECT().CollectAllStatus(mock.Anything, mock.Anything).Return(map[int64]*types.StreamingNodeStatus{}, nil).Maybe()
+		return manager
+	}
+	newSession := func(t *testing.T) *sessionutil.MockSession {
+		session := sessionutil.NewMockSession(t)
+		session.EXPECT().GetRegisteredRevision().Return(int64(1))
+		return session
+	}
+	prepareCatalog := func(t *testing.T, persistedVersion int64) *mock_metastore.MockStreamingCoordCataLog {
+		catalog := mock_metastore.NewMockStreamingCoordCataLog(t)
+		catalog.EXPECT().GetCChannel(mock.Anything).Return(&streamingpb.CChannelMeta{Pchannel: "chunking-ready-channel"}, nil)
+		catalog.EXPECT().GetVersion(mock.Anything).Return(&streamingpb.StreamingVersion{Version: persistedVersion}, nil)
+		catalog.EXPECT().ListPChannel(mock.Anything).Return(nil, nil)
+		catalog.EXPECT().GetReplicateConfiguration(mock.Anything).Return(nil, nil)
+		return catalog
+	}
+
+	ctx := context.Background()
+	oldNodeKey := path.Join(metaRoot, sessionutil.DefaultServiceRoot, typeutil.StreamingNodeRole+"-old")
+	newNodeKey := path.Join(metaRoot, sessionutil.DefaultServiceRoot, typeutil.StreamingNodeRole+"-new")
+	legacyProxyKey := path.Join(metaRoot, sessionutil.DefaultServiceRoot, typeutil.ProxyRole+"-legacy")
+	readyProxyKey := path.Join(metaRoot, sessionutil.DefaultServiceRoot, typeutil.ProxyRole+"-ready")
+	// Version 4 may be persisted directly from an earlier cumulative version,
+	// but only after both its Proxy and StreamingNode prerequisites are true.
+	catalog := prepareCatalog(t, channel.StreamingVersion260)
+	savedVersions := make(chan int64, 1)
+	catalog.EXPECT().SaveVersion(mock.Anything, mock.Anything).Run(func(_ context.Context, version *streamingpb.StreamingVersion) {
+		savedVersions <- version.GetVersion()
+	}).Return(nil).Once()
+	resource.InitForTest(
+		resource.OptETCD(etcdClient),
+		resource.OptStreamingCatalog(catalog),
+		resource.OptStreamingManagerClient(newManagerClient(t)),
+		resource.OptSession(newSession(t)),
+	)
+	putProxySession(t, ctx, readyProxyKey, "3.0.0-beta")
+	defer etcdClient.Delete(context.Background(), legacyProxyKey)
+	defer etcdClient.Delete(context.Background(), readyProxyKey)
+
+	b, err := balancer.RecoverBalancer(ctx, newStaticChannelProvider())
+	require.NoError(t, err)
+	before, err := b.GetLatestChannelAssignment()
+	require.NoError(t, err)
+	assertNotActivated := func(reason string) {
+		select {
+		case version := <-savedVersions:
+			assert.Fail(t, reason, "version: %d", version)
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+
+	// An empty StreamingNode snapshot must not vacuously enable a permanent
+	// feature after the Proxy prerequisite becomes ready.
+	assertNotActivated("chunking activated with no StreamingNode session")
+
+	putProxySession(t, ctx, legacyProxyKey, "2.6.6")
+	putRoleSession(t, ctx, oldNodeKey, 1, "3.0.1")
+	putRoleSession(t, ctx, newNodeKey, 2, "3.0.2")
+	defer etcdClient.Delete(context.Background(), oldNodeKey)
+	defer etcdClient.Delete(context.Background(), newNodeKey)
+	assertNotActivated("chunking activated with an old StreamingNode session")
+
+	_, err = etcdClient.Delete(ctx, oldNodeKey)
+	require.NoError(t, err)
+	assertNotActivated("chunking activated with a legacy Proxy session")
+
+	_, err = etcdClient.Delete(ctx, legacyProxyKey)
+	require.NoError(t, err)
+	select {
+	case version := <-savedVersions:
+		assert.Equal(t, channel.StreamingVersionChunking, version)
+	case <-time.After(3 * time.Second):
+		require.Fail(t, "chunking activation was not persisted after all prerequisites became compatible")
+	}
+
+	after, err := b.GetLatestChannelAssignment()
+	require.NoError(t, err)
+	assert.Equal(t, channel.StreamingVersionChunking, after.StreamingVersion.GetVersion())
+	assert.Equal(t, before.Version.Local+1, after.Version.Local)
+	b.Close()
+
+	// Restart recovers and publishes the persisted capability without another
+	// activation transition.
+	recoveredCatalog := prepareCatalog(t, channel.StreamingVersionChunking)
+	resource.InitForTest(
+		resource.OptETCD(etcdClient),
+		resource.OptStreamingCatalog(recoveredCatalog),
+		resource.OptStreamingManagerClient(newManagerClient(t)),
+		resource.OptSession(newSession(t)),
+	)
+	recovered, err := balancer.RecoverBalancer(ctx, newStaticChannelProvider())
+	require.NoError(t, err)
+	recoveredAssignment, err := recovered.GetLatestChannelAssignment()
+	require.NoError(t, err)
+	assert.Equal(t, channel.StreamingVersionChunking, recoveredAssignment.StreamingVersion.GetVersion())
+	recovered.Close()
+}
+
 func TestBalancer_WithRecoveryLag(t *testing.T) {
 	paramtable.Init()
 	etcdClient, _ := kvfactory.GetEtcdAndPath()
@@ -799,8 +917,12 @@ func TestBalancer_DynamicChannelProviderClosed(t *testing.T) {
 
 func putProxySession(t *testing.T, ctx context.Context, key string, version string) {
 	t.Helper()
+	putRoleSession(t, ctx, key, 1, version)
+}
 
-	raw := sessionutil.SessionRaw{Version: version, ServerID: 1}
+func putRoleSession(t *testing.T, ctx context.Context, key string, serverID int64, version string) {
+	t.Helper()
+	raw := sessionutil.SessionRaw{Version: version, ServerID: serverID}
 	data, err := json.Marshal(raw)
 	assert.NoError(t, err)
 	_, err = resource.Resource().ETCD().Put(ctx, key, string(data))

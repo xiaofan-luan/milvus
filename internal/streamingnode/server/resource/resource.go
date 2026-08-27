@@ -1,6 +1,7 @@
 package resource
 
 import (
+	"context"
 	"reflect"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -23,6 +24,10 @@ var r *resourceImpl // singleton resource instance
 
 // optResourceInit is the option to initialize the resource.
 type optResourceInit func(r *resourceImpl)
+
+// StreamingVersionChecker checks whether the persisted cluster streaming
+// version has reached the requested value without waiting.
+type StreamingVersionChecker func(ctx context.Context, minimumVersion int64) error
 
 // OptETCD provides the etcd client to the resource.
 func OptETCD(etcd *clientv3.Client) optResourceInit {
@@ -55,6 +60,13 @@ func OptStreamingNodeCatalog(catalog metastore.StreamingNodeCataLog) optResource
 	}
 }
 
+// OptStreamingVersionChecker provides the cluster capability checker.
+func OptStreamingVersionChecker(checker StreamingVersionChecker) optResourceInit {
+	return func(r *resourceImpl) {
+		r.streamingVersionChecker = checker
+	}
+}
+
 // Apply initializes the singleton of resources.
 // Should be call when streaming node startup.
 func Apply(opts ...optResourceInit) {
@@ -80,6 +92,7 @@ func Init(opts ...optResourceInit) {
 	assertNotNil(newR.TSOAllocator())
 	assertNotNil(newR.MixCoordClient())
 	assertNotNil(newR.StreamingNodeCatalog())
+	assertNotNil(newR.streamingVersionChecker)
 	assertNotNil(newR.SegmentStatsManager())
 	assertNotNil(newR.TimeTickInspector())
 	assertNotNil(newR.SyncManager())
@@ -102,16 +115,17 @@ func Resource() *resourceImpl {
 // resourceImpl is a basic resource dependency for streamingnode server.
 // All utility on it is concurrent-safe and singleton.
 type resourceImpl struct {
-	logger               *mlog.Logger
-	timestampAllocator   idalloc.Allocator
-	idAllocator          idalloc.Allocator
-	etcdClient           *clientv3.Client
-	chunkManager         storage.ChunkManager
-	mixCoordClient       *syncutil.Future[types.MixCoordClient]
-	streamingNodeCatalog metastore.StreamingNodeCataLog
-	segmentStatsManager  *stats.StatsManager
-	timeTickInspector    tinspector.TimeTickSyncInspector
-	vchannelTempStorage  *vchantempstore.VChannelTempStorage
+	logger                  *mlog.Logger
+	timestampAllocator      idalloc.Allocator
+	idAllocator             idalloc.Allocator
+	etcdClient              *clientv3.Client
+	chunkManager            storage.ChunkManager
+	mixCoordClient          *syncutil.Future[types.MixCoordClient]
+	streamingNodeCatalog    metastore.StreamingNodeCataLog
+	streamingVersionChecker StreamingVersionChecker
+	segmentStatsManager     *stats.StatsManager
+	timeTickInspector       tinspector.TimeTickSyncInspector
+	vchannelTempStorage     *vchantempstore.VChannelTempStorage
 
 	// TODO: Global flusher components, should be removed afteer flushering in wal refactoring.
 	syncMgr syncmgr.SyncManager
@@ -156,6 +170,12 @@ func (r *resourceImpl) MixCoordClient() *syncutil.Future[types.MixCoordClient] {
 // StreamingNodeCataLog returns the streaming node catalog.
 func (r *resourceImpl) StreamingNodeCatalog() metastore.StreamingNodeCataLog {
 	return r.streamingNodeCatalog
+}
+
+// CheckStreamingVersion checks the latest assignment snapshot for a durably
+// enabled cluster streaming capability without waiting.
+func (r *resourceImpl) CheckStreamingVersion(ctx context.Context, minimumVersion int64) error {
+	return r.streamingVersionChecker(ctx, minimumVersion)
 }
 
 func (r *resourceImpl) SegmentStatsManager() *stats.StatsManager {

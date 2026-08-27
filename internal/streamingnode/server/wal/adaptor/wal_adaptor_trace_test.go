@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
@@ -12,16 +13,165 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/milvus-io/milvus/internal/streamingnode/server/resource"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/metricsutil"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/utility"
+	"github.com/milvus-io/milvus/internal/util/streamingutil/status"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/types"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/walimpls/helper"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/walimpls/impls/walimplstest"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 )
 
-func TestRetryAppendOverwritesTraceContextWithAppendImplSpan(t *testing.T) {
+type chunkRetryTestWALImpls struct {
+	*firstTimeTickWALImpls
+}
+
+func (w *chunkRetryTestWALImpls) WALName() message.WALName {
+	return message.WALNamePulsar
+}
+
+func TestAppendWithOptionalChunkingUsesSuccessfulHeadIDOnDurableAssembly(t *testing.T) {
+	resource.InitForTest(t)
+	params := paramtable.Get()
+	maxMessageSizeKey := params.PulsarCfg.MaxMessageSize.Key
+	reserveSizeKey := params.PulsarCfg.MessageReserveSize.Key
+	require.NoError(t, params.Save(maxMessageSizeKey, "2"))
+	require.NoError(t, params.Save(reserveSizeKey, "1"))
+	t.Cleanup(func() {
+		assert.NoError(t, params.Reset(reserveSizeKey))
+		assert.NoError(t, params.Reset(maxMessageSizeKey))
+	})
+
+	var persisted []message.ImmutableMessage
+	var nextID int64
+	headAttempts := 0
+	inner := newFirstTimeTickWALImpls(func(_ context.Context, msg message.MutableMessage) (message.MessageID, error) {
+		id := walimplstest.NewTestMessageID(nextID)
+		nextID++
+		// Snapshot the record before returning the result: the first head attempt
+		// models a broker-persisted record whose acknowledgement was lost.
+		persisted = append(persisted, msg.IntoImmutableMessage(id))
+		if message.ChunkIndex(msg) == 0 {
+			headAttempts++
+			if headAttempts == 1 {
+				return nil, errors.New("head persisted but acknowledgement lost")
+			}
+		}
+		return id, nil
+	})
+	walImpls := &chunkRetryTestWALImpls{firstTimeTickWALImpls: inner}
+	roWAL := adaptImplsToROWAL(walImpls, func() {})
+	defer roWAL.Close()
+	writeMetrics := metricsutil.NewWriteMetrics(walImpls.Channel(), walImpls.WALName())
+	defer writeMetrics.Close()
+	w := &walAdaptorImpl{
+		roWALAdaptorImpl: roWAL,
+		rwWALImpls:       walImpls,
+		writeMetrics:     writeMetrics,
+	}
+
+	msg := message.CreateTestEmptyInsertMesage(1, nil).
+		WithTimeTick(100).
+		WithLastConfirmedUseMessageID()
+	require.Greater(t, len(msg.IntoMessageProto().GetPayload()), 1)
+
+	acknowledgedID, err := w.appendWithOptionalChunking(context.Background(), msg)
+	require.NoError(t, err)
+	require.Equal(t, 2, headAttempts)
+	require.Greater(t, len(persisted), 2)
+	require.True(t, walimplstest.NewTestMessageID(0).EQ(persisted[0].MessageID()))
+	require.True(t, walimplstest.NewTestMessageID(1).EQ(persisted[1].MessageID()))
+	require.True(t, walimplstest.NewTestMessageID(1).EQ(acknowledgedID))
+
+	var assembler message.ChunkAssembler
+	var assembled message.ImmutableMessage
+	for _, physical := range persisted {
+		candidate, handled, err := assembler.Push(physical)
+		require.NoError(t, err)
+		require.True(t, handled)
+		if candidate != nil {
+			require.Nil(t, assembled)
+			assembled = candidate
+		}
+	}
+	require.NotNil(t, assembled)
+	assert.True(t, acknowledgedID.EQ(assembled.MessageID()))
+	assert.Equal(t, msg.IntoMessageProto().GetPayload(), assembled.IntoImmutableMessageProto().GetPayload())
+}
+
+func TestAppendWithOptionalChunkingRejectsBeforeStreamingVersion(t *testing.T) {
+	checkCount := 0
+	resource.InitForTest(t, resource.OptStreamingVersionChecker(func(_ context.Context, minimumVersion int64) error {
+		assert.Equal(t, types.StreamingVersionChunking, minimumVersion)
+		checkCount++
+		return status.NewUnrecoverableError("WAL payload chunking is not ready")
+	}))
+
+	params := paramtable.Get()
+	maxMessageSizeKey := params.PulsarCfg.MaxMessageSize.Key
+	reserveSizeKey := params.PulsarCfg.MessageReserveSize.Key
+	require.NoError(t, params.Save(maxMessageSizeKey, "2"))
+	require.NoError(t, params.Save(reserveSizeKey, "1"))
+	t.Cleanup(func() {
+		assert.NoError(t, params.Reset(reserveSizeKey))
+		assert.NoError(t, params.Reset(maxMessageSizeKey))
+	})
+
+	var persisted []message.MutableMessage
+	inner := newFirstTimeTickWALImpls(func(_ context.Context, msg message.MutableMessage) (message.MessageID, error) {
+		persisted = append(persisted, msg)
+		return walimplstest.NewTestMessageID(int64(len(persisted))), nil
+	})
+	w := &walAdaptorImpl{
+		rwWALImpls: &chunkRetryTestWALImpls{firstTimeTickWALImpls: inner},
+	}
+	msg := message.CreateTestEmptyInsertMesage(1, nil).
+		WithTimeTick(100).
+		WithLastConfirmedUseMessageID()
+	require.Greater(t, len(msg.IntoMessageProto().GetPayload()), 1)
+
+	_, err := w.appendWithOptionalChunking(context.Background(), msg)
+	require.Error(t, err)
+	assert.True(t, status.AsStreamingError(err).IsUnrecoverable())
+	assert.Equal(t, 1, checkCount)
+	assert.Empty(t, persisted)
+
+	// Ordinary traffic keeps using the single-record path and does not consult
+	// the capability gate.
+	small := message.CreateTestTimeTickSyncMessage(t, 1, 99, walimplstest.NewTestMessageID(0))
+	_, err = w.appendWithOptionalChunking(context.Background(), small)
+	require.NoError(t, err)
+	require.Len(t, persisted, 1)
+	assert.False(t, message.IsChunkedPayload(persisted[0]))
+	assert.Equal(t, 1, checkCount)
+}
+
+func TestAppendWithOptionalChunkingDoesNotCheckWithoutRecordLimit(t *testing.T) {
+	resource.InitForTest(t, resource.OptStreamingVersionChecker(func(context.Context, int64) error {
+		return errors.New("unexpected streaming version check")
+	}))
+
+	var persisted []message.MutableMessage
+	w := &walAdaptorImpl{
+		rwWALImpls: newFirstTimeTickWALImpls(func(_ context.Context, msg message.MutableMessage) (message.MessageID, error) {
+			persisted = append(persisted, msg)
+			return walimplstest.NewTestMessageID(1), nil
+		}),
+	}
+	msg := message.CreateTestEmptyInsertMesage(1, nil).
+		WithTimeTick(100).
+		WithLastConfirmedUseMessageID()
+
+	_, err := w.appendWithOptionalChunking(context.Background(), msg)
+	require.NoError(t, err)
+	require.Len(t, persisted, 1)
+	assert.False(t, message.IsChunkedPayload(persisted[0]))
+}
+
+func TestAppendWithOptionalChunkingOverwritesTraceContextWithAppendImplSpan(t *testing.T) {
 	exporter := tracetest.NewInMemoryExporter()
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithSyncer(exporter),
@@ -45,7 +195,7 @@ func TestRetryAppendOverwritesTraceContextWithAppendImplSpan(t *testing.T) {
 		}),
 	}
 
-	_, err := w.retryAppendWhenRecoverableError(sourceCtx, msg)
+	_, err := w.appendWithOptionalChunking(sourceCtx, msg)
 	require.NoError(t, err)
 
 	spans := exporter.GetSpans()
@@ -67,7 +217,7 @@ func TestRetryAppendOverwritesTraceContextWithAppendImplSpan(t *testing.T) {
 	assert.Equal(t, appendImpl.SpanContext.SpanID(), msgSC.SpanID())
 }
 
-func TestRetryAppendSkipsTraceForTimeTickMessage(t *testing.T) {
+func TestAppendWithOptionalChunkingSkipsTraceForTimeTickMessage(t *testing.T) {
 	exporter := tracetest.NewInMemoryExporter()
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithSyncer(exporter),
@@ -93,7 +243,7 @@ func TestRetryAppendSkipsTraceForTimeTickMessage(t *testing.T) {
 		}),
 	}
 
-	_, err := w.retryAppendWhenRecoverableError(sourceCtx, msg)
+	_, err := w.appendWithOptionalChunking(sourceCtx, msg)
 	require.NoError(t, err)
 
 	for _, s := range exporter.GetSpans() {

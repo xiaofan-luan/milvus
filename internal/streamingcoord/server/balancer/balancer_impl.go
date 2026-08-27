@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	semver "github.com/blang/semver/v4"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/sync/errgroup"
 
@@ -30,6 +31,11 @@ const (
 	versionChecker260 = "<2.6.0-dev"
 	versionChecker265 = "<2.6.6-dev"
 	versionChecker300 = "<3.0.0-beta"
+)
+
+var (
+	minChunkingProxyVersion         = semver.MustParse("3.0.0-beta")
+	minChunkingStreamingNodeVersion = semver.MustParse("3.0.2")
 )
 
 // errVersionWatchDone is an INTERNAL break-signal sentinel used by
@@ -361,6 +367,20 @@ func (b *balancerImpl) execute(ready260Future *syncutil.Future[error]) {
 	}
 	channelChanged := statsManager.WatchAtChannelCountChanged()
 
+	// WAL chunking activation follows the existing role-session resolver/watch
+	// path in the background. Keep its lifetime inside execute so it neither
+	// blocks balancing nor outlives the balancer.
+	activationCtx, cancelActivation := context.WithCancel(b.backgroundTaskNotifier.Context())
+	activationDone := make(chan struct{})
+	go func() {
+		defer close(activationDone)
+		b.watchWALChunkingActivation(activationCtx)
+	}()
+	defer func() {
+		cancelActivation()
+		<-activationDone
+	}()
+
 	for {
 		// Wait for next balance trigger.
 		// Maybe trigger by timer or by request.
@@ -424,6 +444,57 @@ func (b *balancerImpl) execute(ready260Future *syncutil.Future[error]) {
 		b.Logger().Info(b.backgroundTaskNotifier.Context(), "apply balance success")
 		balanceTimer.DisableBackoff()
 	}
+}
+
+// watchWALChunkingActivation publishes the cumulative chunking capability
+// after the existing Proxy schema prerequisite and every StreamingNode can
+// read chunked WAL records. It uses the existing role-session resolver/watch;
+// no raw etcd read or balance-loop polling is added.
+func (b *balancerImpl) watchWALChunkingActivation(ctx context.Context) {
+	if b.channelMetaManager.IsStreamingVersionAtLeast(channel.StreamingVersionChunking) {
+		return
+	}
+	if err := b.channelMetaManager.WaitUntilStreamingEnabled(ctx); err != nil {
+		if ctx.Err() == nil {
+			b.Logger().Warn(ctx, "failed to wait for streaming enablement before WAL chunking activation", mlog.Err(err))
+		}
+		return
+	}
+
+	// The supported rollout upgrades StreamingNodes before Proxy. Wait for at
+	// least one compatible session before waiting for the incompatible set to
+	// become empty, so an empty role snapshot cannot activate the feature.
+	if err := b.blockUntilRoleHasVersion(ctx, typeutil.StreamingNodeRole, ">="+minChunkingStreamingNodeVersion.String()); err != nil {
+		if ctx.Err() == nil {
+			b.Logger().Warn(ctx, "failed to observe a chunk-capable StreamingNode", mlog.Err(err))
+		}
+		return
+	}
+	if err := b.blockUntilRoleGreaterThanVersion(ctx, typeutil.StreamingNodeRole, "<"+minChunkingStreamingNodeVersion.String()); err != nil {
+		if ctx.Err() == nil {
+			b.Logger().Warn(ctx, "failed to wait for chunk-capable StreamingNodes", mlog.Err(err))
+		}
+		return
+	}
+	if err := b.blockUntilRoleHasVersion(ctx, typeutil.ProxyRole, ">="+minChunkingProxyVersion.String()); err != nil {
+		if ctx.Err() == nil {
+			b.Logger().Warn(ctx, "failed to observe a schema-version-capable Proxy", mlog.Err(err))
+		}
+		return
+	}
+	if err := b.blockUntilRoleGreaterThanVersion(ctx, typeutil.ProxyRole, versionChecker300); err != nil {
+		if ctx.Err() == nil {
+			b.Logger().Warn(ctx, "failed to wait for schema-version-capable Proxies", mlog.Err(err))
+		}
+		return
+	}
+
+	if err := b.channelMetaManager.MarkStreamingVersion(ctx, channel.StreamingVersionChunking); err != nil {
+		b.Logger().Warn(ctx, "failed to activate WAL payload chunking", mlog.Err(err))
+		return
+	}
+	b.Logger().Info(ctx, "WAL payload chunking is activated",
+		mlog.String("minimumStreamingNodeVersion", minChunkingStreamingNodeVersion.String()))
 }
 
 // checkIfAllNodeGreaterThan260AndWatch check if all node is greater than 2.6.0.
@@ -549,6 +620,30 @@ func (b *balancerImpl) blockUntilRoleGreaterThanVersion(ctx context.Context, rol
 		return err
 	}
 	logger.Info(ctx, "all nodes is greater than version when watching", mlog.String("version", versionChecker))
+	return nil
+}
+
+// blockUntilRoleHasVersion waits until at least one session of role matches
+// versionRange. It prevents an empty role snapshot from satisfying a feature
+// activation prerequisite vacuously.
+func (b *balancerImpl) blockUntilRoleHasVersion(ctx context.Context, role string, versionRange string) error {
+	logger := b.Logger().With(mlog.String("role", role))
+	logger.Info(ctx, "start to wait for a node in version range", mlog.String("version", versionRange))
+	rb := resolver.NewSessionBuilder(resource.Resource().ETCD(),
+		discoverer.OptSDPrefix(sessionutil.GetSessionPrefixByRole(role)),
+		discoverer.OptSDVersionRange(versionRange))
+	defer rb.Close()
+
+	err := rb.Resolver().Watch(ctx, func(vs resolver.VersionedState) error {
+		if len(vs.Sessions()) > 0 {
+			return errVersionWatchDone
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, errVersionWatchDone) {
+		return err
+	}
+	logger.Info(ctx, "observed a node in version range", mlog.String("version", versionRange))
 	return nil
 }
 

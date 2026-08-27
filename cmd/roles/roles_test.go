@@ -26,6 +26,7 @@ import (
 
 	"github.com/milvus-io/milvus/internal/util/fileresource"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
 func TestRoles(t *testing.T) {
@@ -98,6 +99,17 @@ func TestResolveFileResourceMode(t *testing.T) {
 		roles := MilvusRoles{EnableProxy: true}
 		assert.Equal(t, fileresource.SyncMode, roles.resolveFileResourceMode())
 	})
+}
+
+func TestShouldInitStreaming(t *testing.T) {
+	assert.False(t, (&MilvusRoles{ServerType: typeutil.DataNodeRole, EnableDataNode: true}).shouldInitStreaming())
+	assert.False(t, (&MilvusRoles{ServerType: typeutil.MixtureRole, EnableDataNode: true, EnableQueryNode: true}).shouldInitStreaming())
+	assert.True(t, (&MilvusRoles{
+		ServerType:          typeutil.MixtureRole,
+		EnableDataNode:      true,
+		EnableStreamingNode: true,
+	}).shouldInitStreaming())
+	assert.True(t, (&MilvusRoles{ServerType: typeutil.StandaloneRole, EnableDataNode: true}).shouldInitStreaming())
 }
 
 func TestCleanLocalDir(t *testing.T) {

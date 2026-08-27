@@ -32,6 +32,7 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
 	mix "github.com/milvus-io/milvus/internal/distributed/mixcoord/client"
+	"github.com/milvus-io/milvus/internal/distributed/streaming"
 	"github.com/milvus-io/milvus/internal/distributed/utils"
 	etcdkv "github.com/milvus-io/milvus/internal/kv/etcd"
 	tikvkv "github.com/milvus-io/milvus/internal/kv/tikv"
@@ -228,6 +229,7 @@ func (s *Server) init() (err error) {
 		WithMixCoordClient(s.mixCoord).
 		WithSession(s.session).
 		WithMetaKV(s.metaKV).
+		WithStreamingVersionChecker(streaming.CheckStreamingVersion).
 		Build()
 	return nil
 }

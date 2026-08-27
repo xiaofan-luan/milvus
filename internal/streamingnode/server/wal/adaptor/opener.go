@@ -256,6 +256,7 @@ func (o *openerAdaptorImpl) openRWWAL(ctx context.Context, l walimpls.WALImpls, 
 			ChannelInfo:        l.Channel(),
 			RecoverySnapshot:   snapshot,
 			RateLimitComponent: roWAL.WALRateLimitComponent,
+			OnFatal:            roWAL.markUnavailable,
 		})
 		resources.flusher = flusher
 	}
@@ -329,6 +330,7 @@ func (o *openerAdaptorImpl) handleAlterWALFlushingStage(ctx context.Context, opt
 			ChannelInfo:        roWAL.Channel(),
 			RecoverySnapshot:   snapshot,
 			RateLimitComponent: roWAL.WALRateLimitComponent,
+			OnFatal:            roWAL.markUnavailable,
 		})
 		resources.flusher = flusher
 	}
@@ -344,6 +346,8 @@ func (o *openerAdaptorImpl) handleAlterWALFlushingStage(ctx context.Context, opt
 	defer ticker.Stop()
 
 	const defaultWALSwitchFlushTimeout = 1 * time.Minute
+	timeout := time.NewTimer(defaultWALSwitchFlushTimeout)
+	defer timeout.Stop()
 
 	// Periodically check flush progress until target time tick is reached
 	var flusherCP *utility.WALCheckpoint
@@ -369,11 +373,13 @@ func (o *openerAdaptorImpl) handleAlterWALFlushingStage(ctx context.Context, opt
 				mlog.Uint64("currentTS", flusherCP.TimeTick),
 				mlog.Uint64("targetTS", targetTimeTick),
 				mlog.Uint64("remainingTS", remaining))
-		case <-time.After(defaultWALSwitchFlushTimeout):
+		case <-timeout.C:
 			mlog.Warn(ctx, "timeout waiting for flush completion",
 				mlog.String("channel", opt.Channel.Name),
 				mlog.Duration("timeout", defaultWALSwitchFlushTimeout))
 			return status.NewInner("timeout waiting for flush completion during WAL switch")
+		case <-roWAL.Available():
+			return status.NewInner("wal became unavailable while waiting for flush completion during WAL switch")
 		case <-ctx.Done():
 			mlog.Warn(ctx, "context canceled while waiting for flush completion", mlog.String("channel", opt.Channel.Name), mlog.Err(ctx.Err()))
 			return errors.Wrap(ctx.Err(), "context canceled during WAL switch flush waiting")

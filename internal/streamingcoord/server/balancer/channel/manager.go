@@ -24,9 +24,10 @@ import (
 )
 
 const (
-	StreamingVersion260 = 1 // streaming version that since 2.6.0, the streaming based WAL is available.
-	StreamingVersion265 = 2 // streaming version that since 2.6.5, the WAL based DDL is available.
-	StreamingVersion300 = 3 // streaming version that since 3.0.0, schema-drop DDL is available.
+	StreamingVersion260      = 1                              // streaming version that since 2.6.0, the streaming based WAL is available.
+	StreamingVersion265      = 2                              // streaming version that since 2.6.5, the WAL based DDL is available.
+	StreamingVersion300      = 3                              // streaming version that since 3.0.0, schema-drop DDL is available.
+	StreamingVersionChunking = types.StreamingVersionChunking // all StreamingNodes can read chunked WAL records.
 )
 
 var ErrChannelNotExist = errors.New("channel not exist")
@@ -369,11 +370,15 @@ func (cm *ChannelManager) MarkStreamingVersion(ctx context.Context, version int6
 	if cm.streamingVersion.Version >= version {
 		return nil
 	}
-	cm.streamingVersion.Version = version
-	if err := resource.Resource().StreamingCatalog().SaveVersion(ctx, cm.streamingVersion); err != nil {
+	nextVersion := &streamingpb.StreamingVersion{Version: version}
+	if err := resource.Resource().StreamingCatalog().SaveVersion(ctx, nextVersion); err != nil {
 		cm.Logger().Error(ctx, "failed to save streaming version", mlog.Err(err))
 		return err
 	}
+	cm.streamingVersion = nextVersion
+	cm.version.Local++
+	cm.metrics.UpdateAssignmentVersion(cm.version.Local)
+	cm.cond.UnsafeBroadcast()
 	return nil
 }
 
@@ -724,6 +729,10 @@ func (cm *ChannelManager) applyAssignments(cb WatchChannelAssignmentsCallback) (
 		}
 	}
 	version := cm.version
+	var streamingVersion *streamingpb.StreamingVersion
+	if cm.streamingVersion != nil {
+		streamingVersion = proto.Clone(cm.streamingVersion).(*streamingpb.StreamingVersion)
+	}
 	cchannelAssignment := proto.Clone(cm.cchannelMeta).(*streamingpb.CChannelMeta)
 	pchannelViews := newPChannelView(cm.channels)
 	cm.cond.L.Unlock()
@@ -733,7 +742,7 @@ func (cm *ChannelManager) applyAssignments(cb WatchChannelAssignmentsCallback) (
 		replicateConfig = cm.replicateConfig.GetReplicateConfiguration()
 	}
 	return version, cb(WatchChannelAssignmentsCallbackParam{
-		StreamingVersion: cm.streamingVersion,
+		StreamingVersion: streamingVersion,
 		Version:          version,
 		CChannelAssignment: &streamingpb.CChannelAssignment{
 			Meta: cchannelAssignment,

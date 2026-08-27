@@ -26,6 +26,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/time/rate"
+
 	"github.com/milvus-io/milvus/pkg/v3/metrics"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/util"
@@ -38,6 +40,14 @@ const (
 	defaultEtcdLogPath        = "stdout"
 	KafkaProducerConfigPrefix = "kafka.producer."
 	KafkaConsumerConfigPrefix = "kafka.consumer."
+
+	// defaultPulsarMessageReserveSize is the headroom kept outside the plaintext
+	// message body for the streaming message header, cipher metadata/expansion,
+	// properties added before WAL append, and Pulsar message metadata. Sized
+	// generously (64 KiB): the WAL-impl payload chunker slices bodies into
+	// records of at most (limit - reserve) bytes, and this reserve must absorb
+	// the per-record properties clone plus the backend envelope of every chunk.
+	defaultPulsarMessageReserveSize = 64 * 1024
 
 	defaultLocalStoragePath = "/var/lib/milvus/data"
 )
@@ -73,6 +83,26 @@ func (p *ServiceParam) init(bt *BaseTable) {
 
 func (p *ServiceParam) RocksmqEnable() bool {
 	return p.RocksmqCfg.Path.GetValue() != ""
+}
+
+// WALMaxMessageSize reports the per-record limit used by WAL chunking:
+// the backend-enforced pulsar.maxMessageSize and
+// kafka.producer.message.max.bytes limits, or Milvus' configured
+// woodpecker.maxMessageSize chunk threshold. RocksMQ has neither a hard
+// per-entry cap nor a configured chunk threshold (and neither do unrecognized
+// names), so 0 is returned there. This is the single place a WAL name maps to
+// its chunking limit.
+func (p *ServiceParam) WALMaxMessageSize(walName string) int {
+	switch walName {
+	case "kafka":
+		return p.KafkaCfg.ProducerMessageMaxBytes.GetAsInt()
+	case "woodpecker":
+		return p.WoodpeckerCfg.MaxMessageSize.GetAsInt()
+	case "pulsar":
+		return p.PulsarCfg.MaxMessageSize.GetAsInt()
+	default:
+		return 0
+	}
 }
 
 func (p *ServiceParam) PulsarEnable() bool {
@@ -726,6 +756,11 @@ type WoodpeckerConfig struct {
 	MetaType   ParamItem `refreshable:"false"`
 	MetaPrefix ParamItem `refreshable:"false"`
 
+	// MaxMessageSize is Milvus' target upper bound for one Woodpecker WAL
+	// record. Woodpecker does not enforce a corresponding single-entry hard
+	// limit; the WAL layer uses this value as its chunk threshold (#52474).
+	MaxMessageSize ParamItem `refreshable:"true"`
+
 	// client
 	AppendQueueSize           ParamItem `refreshable:"true"`
 	AppendMaxRetries          ParamItem `refreshable:"true"`
@@ -793,6 +828,27 @@ func (p *WoodpeckerConfig) Init(base *BaseTable) {
 		Export:       true,
 	}
 	p.MetaPrefix.Init(base.mgr)
+
+	p.MaxMessageSize = ParamItem{
+		Key:          "woodpecker.maxMessageSize",
+		Version:      "3.0.2",
+		DefaultValue: strconv.Itoa(10 * 1024 * 1024),
+		Doc: `The target maximum size of each Woodpecker WAL record produced by Milvus. Unit: Byte.
+Woodpecker does not enforce a corresponding single-entry hard limit. Milvus uses this value as the WAL-layer chunk threshold and splits larger payloads into multiple records.
+Must be a positive 32-bit integer larger than pulsar.messageReserveSize. Invalid or out-of-range values fall back to the default 10 MiB limit.`,
+		Export: true,
+		Formatter: func(value string) string {
+			maxMessageSize, err := strconv.ParseInt(value, 10, 32)
+			if err != nil || maxMessageSize <= 0 {
+				mlog.Warn(context.TODO(), "woodpecker.maxMessageSize must be a positive 32-bit integer, using default",
+					mlog.String("configured", value),
+					mlog.Int("default", 10*1024*1024))
+				return strconv.Itoa(10 * 1024 * 1024)
+			}
+			return value
+		},
+	}
+	p.MaxMessageSize.Init(base.mgr)
 
 	p.AppendQueueSize = ParamItem{
 		Key:          "woodpecker.client.segmentAppend.queueSize",
@@ -1144,11 +1200,12 @@ Valid values: [auto, enable, disable]`,
 // /////////////////////////////////////////////////////////////////////////////
 // --- pulsar ---
 type PulsarConfig struct {
-	Address        ParamItem `refreshable:"false"`
-	Port           ParamItem `refreshable:"false"`
-	WebAddress     ParamItem `refreshable:"false"`
-	WebPort        ParamItem `refreshable:"false"`
-	MaxMessageSize ParamItem `refreshable:"true"`
+	Address            ParamItem `refreshable:"false"`
+	Port               ParamItem `refreshable:"false"`
+	WebAddress         ParamItem `refreshable:"false"`
+	WebPort            ParamItem `refreshable:"false"`
+	MaxMessageSize     ParamItem `refreshable:"true"`
+	MessageReserveSize ParamItem `refreshable:"true"`
 
 	// support auth
 	AuthPlugin ParamItem `refreshable:"false"`
@@ -1165,6 +1222,41 @@ type PulsarConfig struct {
 	EnableClientMetrics ParamItem `refreshable:"false"`
 
 	BacklogAutoClearBytes ParamItem `refreshable:"false"`
+}
+
+// GetMessageSizeLimitsFor generalizes the plaintext-body budget to an
+// arbitrary WAL backend's broker limit -- not necessarily Pulsar's own. The
+// reserve amount (streaming message header, properties added before WAL
+// append, cipher metadata/expansion, and broker message metadata) covers the
+// same envelope regardless of which backend produced maxMessageSize, so it is
+// still read from pulsar.messageReserveSize; that config item is not
+// Pulsar-specific in what it represents, only in where it is set.
+func (p *PulsarConfig) GetMessageSizeLimitsFor(maxMessageSize int) (int, int) {
+	return maxMessageSize, normalizePulsarMessageReserve(maxMessageSize, p.MessageReserveSize.GetAsInt())
+}
+
+func normalizePulsarMessageReserve(maxMessageSize, messageReserveSize int) int {
+	if maxMessageSize <= 0 {
+		return 0
+	}
+	if messageReserveSize >= 0 && messageReserveSize < maxMessageSize {
+		return messageReserveSize
+	}
+	// A combination that would fail a startup sanity check, reached through a
+	// live config update. The fallback keeps writes flowing at a sane budget
+	// instead of erroring the append path. This function is reached from every
+	// active WAL's refreshed size cache, so rate-limit the persistent
+	// misconfiguration warning globally by call site.
+	fallback := 0
+	if defaultPulsarMessageReserveSize < maxMessageSize {
+		fallback = defaultPulsarMessageReserveSize
+	}
+	mlog.RatedWarn(context.TODO(), rate.Limit(1.0/60.0),
+		"pulsar.messageReserveSize does not fit under the active WAL message size limit, falling back",
+		mlog.Int("configuredReserve", messageReserveSize),
+		mlog.Int("maxMessageSize", maxMessageSize),
+		mlog.Int("effectiveReserve", fallback))
+	return fallback
 }
 
 func (p *PulsarConfig) Init(base *BaseTable) {
@@ -1230,11 +1322,32 @@ Default value applies when Pulsar is running on the same network with Milvus.`,
 		Version:      "2.0.0",
 		DefaultValue: "2097152",
 		Doc: `The maximum size of each message in Pulsar. Unit: Byte.
-By default, Pulsar can transmit at most 2MB of data in a single message. When the size of inserted data is greater than this value, proxy fragments the data into multiple messages to ensure that they can be transmitted correctly.
+By default, Pulsar can transmit at most 2MB of data in a single message. After the cluster WAL chunking capability is enabled, the StreamingNode WAL layer splits larger payloads into multiple records that fit this limit.
 If the corresponding parameter in Pulsar remains unchanged, increasing this configuration will cause Milvus to fail, and reducing it produces no advantage.`,
 		Export: true,
 	}
 	p.MaxMessageSize.Init(base.mgr)
+
+	p.MessageReserveSize = ParamItem{
+		Key:          "pulsar.messageReserveSize",
+		Version:      "3.0.2",
+		DefaultValue: strconv.Itoa(defaultPulsarMessageReserveSize),
+		Doc: `The headroom reserved out of the active WAL backend's message-size limit (pulsar.maxMessageSize, kafka.producer.message.max.bytes, or woodpecker.maxMessageSize) for message overhead outside the plaintext body. Unit: Byte.
+A produced record carries a streaming message header, properties added before WAL append, cipher metadata/expansion, and broker message metadata on top of the body, so the producer budgets only the active WAL backend's own message-size limit minus this value for the body itself.
+Must be a non-negative 32-bit integer smaller than the active WAL backend's message-size limit. Invalid or out-of-range values fall back to the default reserve size.`,
+		Export: true,
+		Formatter: func(value string) string {
+			reserveSize, err := strconv.ParseInt(value, 10, 32)
+			if err != nil || reserveSize < 0 {
+				mlog.Warn(context.TODO(), "pulsar.messageReserveSize must be a non-negative 32-bit integer, using default",
+					mlog.String("configured", value),
+					mlog.Int("default", defaultPulsarMessageReserveSize))
+				return strconv.Itoa(defaultPulsarMessageReserveSize)
+			}
+			return value
+		},
+	}
+	p.MessageReserveSize.Init(base.mgr)
 
 	p.Tenant = ParamItem{
 		Key:          "pulsar.tenant",

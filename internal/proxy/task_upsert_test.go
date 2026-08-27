@@ -18,8 +18,6 @@ package proxy
 import (
 	"context"
 	"encoding/json"
-	"strconv"
-	"strings"
 	"testing"
 
 	"github.com/bytedance/mockey"
@@ -1131,7 +1129,7 @@ func TestRepackInsertDataForStreamingServiceCASMetadata(t *testing.T) {
 	require.ErrorIs(t, err, merr.ErrServiceInternal)
 }
 
-func TestRepackInsertDataForStreamingServiceSplitsOversizedCASMessage(t *testing.T) {
+func TestRepackInsertDataForStreamingServiceProducesSingleMessageWithCASMetadata(t *testing.T) {
 	mockCache := &MetaCache{}
 	partitionPatch := mockey.Mock((*MetaCache).GetPartitionID).Return(int64(200), nil).Build()
 	defer partitionPatch.UnPatch()
@@ -1146,22 +1144,6 @@ func TestRepackInsertDataForStreamingServiceSplitsOversizedCASMessage(t *testing
 		},
 	}
 
-	unsplit, err := repackInsertDataForStreamingService(
-		context.Background(),
-		mockCache,
-		[]string{vchannel},
-		task.upsertMsg.InsertMsg,
-		task.result,
-		nil,
-		1,
-		groups,
-	)
-	require.NoError(t, err)
-	require.Len(t, unsplit, 1)
-	maxMessageSize := unsplit[0].EstimateSize() - 1
-	require.NoError(t, Params.Save(Params.PulsarCfg.MaxMessageSize.Key, strconv.Itoa(maxMessageSize)))
-	t.Cleanup(func() { Params.Reset(Params.PulsarCfg.MaxMessageSize.Key) })
-
 	msgs, err := repackInsertDataForStreamingService(
 		context.Background(),
 		mockCache,
@@ -1173,65 +1155,21 @@ func TestRepackInsertDataForStreamingServiceSplitsOversizedCASMessage(t *testing
 		groups,
 	)
 	require.NoError(t, err)
-	require.Len(t, msgs, 2)
-
-	rowIDs := make([]int64, 0, len(pks))
-	for _, msg := range msgs {
-		require.LessOrEqual(t, msg.EstimateSize(), maxMessageSize)
-		require.True(t, streamingmessage.HasPartialUpdateCAS(msg))
-		meta, err := streamingmessage.ExtractPartialUpdateCAS(msg)
-		require.NoError(t, err)
-		require.True(t, proto.Equal(groups[vchannel], meta))
-		body := streamingmessage.MustAsMutableInsertMessageV1(msg).MustBody()
-		rowIDs = append(rowIDs, body.GetRowIDs()...)
-	}
-	require.Equal(t, []int64{101, 102}, rowIDs)
-}
-
-func TestRepackInsertDataForStreamingServiceRejectsOversizedSingleRow(t *testing.T) {
-	mockCache := &MetaCache{}
-	partitionPatch := mockey.Mock((*MetaCache).GetPartitionID).Return(int64(200), nil).Build()
-	defer partitionPatch.UnPatch()
-
-	task := partialUpdateCASRealPackTestTask(t, []int64{10}, []int64{10}, nil)
-	vchannel := partialUpdateCASTestVChannels[0]
-	groups := map[string]*messagespb.PartialUpdateCAS{
-		vchannel: {
-			ReadTs:               100,
-			ObservedPchannelTerm: 1,
-		},
-	}
-
-	baseline, err := repackInsertDataForStreamingService(
-		context.Background(),
-		mockCache,
-		[]string{vchannel},
-		task.upsertMsg.InsertMsg,
-		task.result,
-		nil,
-		1,
-		groups,
-	)
+	require.Len(t, msgs, 1)
+	require.True(t, streamingmessage.HasPartialUpdateCAS(msgs[0]))
+	meta, err := streamingmessage.ExtractPartialUpdateCAS(msgs[0])
 	require.NoError(t, err)
-	require.Len(t, baseline, 1)
-	require.NoError(t, Params.Save(Params.PulsarCfg.MaxMessageSize.Key, strconv.Itoa(baseline[0].EstimateSize()-1)))
-	t.Cleanup(func() { Params.Reset(Params.PulsarCfg.MaxMessageSize.Key) })
+	require.True(t, proto.Equal(groups[vchannel], meta))
 
-	_, err = repackInsertDataForStreamingService(
-		context.Background(),
-		mockCache,
-		[]string{vchannel},
-		task.upsertMsg.InsertMsg,
-		task.result,
-		nil,
-		1,
-		groups,
-	)
-	require.ErrorIs(t, err, merr.ErrParameterTooLarge)
+	insert := streamingmessage.MustAsMutableInsertMessageV1(msgs[0])
+	require.Equal(t, uint64(len(pks)), insert.Header().GetPartitions()[0].GetRows())
+	require.Equal(t, []int64{101, 102}, insert.MustBody().GetRowIDs())
 }
 
-func TestRepackInsertDataByPartitionForStreamingServicePropagatesPackingError(t *testing.T) {
+func TestRepackInsertDataByPartitionForStreamingServiceRejectsMisalignedSource(t *testing.T) {
 	task := partialUpdateCASRealPackTestTask(t, []int64{10}, []int64{10}, nil)
+	// A source column shorter than NumRows is a proxy-internal contract
+	// violation and must fail before materialization.
 	task.upsertMsg.InsertMsg.FieldsData = []*schemapb.FieldData{
 		{
 			Type: schemapb.DataType_VarChar,
@@ -1246,7 +1184,6 @@ func TestRepackInsertDataByPartitionForStreamingServicePropagatesPackingError(t 
 	}
 
 	_, err := repackInsertDataByPartitionForStreamingService(
-		context.Background(),
 		200,
 		"_default",
 		[]int{0},
@@ -1255,89 +1192,8 @@ func TestRepackInsertDataByPartitionForStreamingServicePropagatesPackingError(t 
 		nil,
 		1,
 		nil,
-		streamingmessage.WALNamePulsar,
 	)
-	require.ErrorIs(t, err, merr.ErrParameterInvalid)
-}
-
-func TestRepackInsertDataByPartitionForStreamingServicePreservesEntityPackingOrder(t *testing.T) {
-	pks := []int64{10, 20}
-	task := partialUpdateCASRealPackTestTask(t, pks, pks, nil)
-	task.upsertMsg.InsertMsg.HashValues = []uint32{0, 0}
-	task.upsertMsg.InsertMsg.FieldsData = []*schemapb.FieldData{
-		{
-			FieldId: 100,
-			Type:    schemapb.DataType_VarChar,
-			Field: &schemapb.FieldData_Scalars{
-				Scalars: &schemapb.ScalarField{
-					Data: &schemapb.ScalarField_StringData{
-						StringData: &schemapb.StringArray{Data: []string{
-							strings.Repeat("a", 4096),
-							strings.Repeat("b", 4096),
-						}},
-					},
-				},
-			},
-		},
-	}
-	meta := &messagespb.PartialUpdateCAS{
-		ReadTs:               100,
-		ObservedPchannelTerm: 1,
-	}
-
-	baseline, err := repackInsertDataByPartitionForStreamingService(
-		context.Background(),
-		200,
-		"_default",
-		[]int{0},
-		partialUpdateCASTestVChannels[0],
-		task.upsertMsg.InsertMsg,
-		nil,
-		1,
-		meta,
-		streamingmessage.WALNamePulsar,
-	)
-	require.NoError(t, err)
-	require.Len(t, baseline, 1)
-	maxMessageSize := baseline[0].EstimateSize()
-	require.NoError(t, Params.Save(Params.PulsarCfg.MaxMessageSize.Key, strconv.Itoa(maxMessageSize)))
-	t.Cleanup(func() { Params.Reset(Params.PulsarCfg.MaxMessageSize.Key) })
-
-	entityPacked, err := channelmgr.GenInsertMsgsByPartition(
-		context.Background(),
-		0,
-		200,
-		"_default",
-		[]int{0, 1},
-		partialUpdateCASTestVChannels[0],
-		task.upsertMsg.InsertMsg,
-		streamingmessage.WALNamePulsar,
-	)
-	require.NoError(t, err)
-	require.Len(t, entityPacked, 2)
-
-	msgs, err := repackInsertDataByPartitionForStreamingService(
-		context.Background(),
-		200,
-		"_default",
-		[]int{0, 1},
-		partialUpdateCASTestVChannels[0],
-		task.upsertMsg.InsertMsg,
-		nil,
-		1,
-		meta,
-		streamingmessage.WALNamePulsar,
-	)
-	require.NoError(t, err)
-	require.Len(t, msgs, 2)
-
-	rowIDs := make([]int64, 0, len(pks))
-	for _, msg := range msgs {
-		require.LessOrEqual(t, msg.EstimateSize(), maxMessageSize)
-		body := streamingmessage.MustAsMutableInsertMessageV1(msg).MustBody()
-		rowIDs = append(rowIDs, body.GetRowIDs()...)
-	}
-	require.Equal(t, []int64{101, 102}, rowIDs)
+	require.ErrorIs(t, err, merr.ErrDataIntegrity)
 }
 
 func TestRepackInsertDataWithPartitionKeyForStreamingServiceCASMetadata(t *testing.T) {
@@ -1427,7 +1283,7 @@ func TestRepackInsertDataWithPartitionKeyForStreamingServiceCASMetadata(t *testi
 	require.ErrorIs(t, err, merr.ErrServiceInternal)
 }
 
-func TestRepackInsertDataWithPartitionKeyForStreamingServiceSplitsOversizedCASMessage(t *testing.T) {
+func TestRepackInsertDataWithPartitionKeyForStreamingServiceProducesSingleMessageWithCASMetadata(t *testing.T) {
 	mockCache := NewMockCache(t)
 	mockCache.EXPECT().
 		GetPartitions(mock.Anything, mock.Anything, mock.Anything).
@@ -1449,24 +1305,6 @@ func TestRepackInsertDataWithPartitionKeyForStreamingServiceSplitsOversizedCASMe
 		},
 	}
 
-	unsplit, err := repackInsertDataWithPartitionKeyForStreamingService(
-		context.Background(),
-		mockCache,
-		[]string{vchannel},
-		task.upsertMsg.InsertMsg,
-		task.result,
-		task.partitionKeys,
-		nil,
-		task.schema.CollectionSchema,
-		1,
-		groups,
-	)
-	require.NoError(t, err)
-	require.Len(t, unsplit, 1)
-	maxMessageSize := unsplit[0].EstimateSize() - 1
-	require.NoError(t, Params.Save(Params.PulsarCfg.MaxMessageSize.Key, strconv.Itoa(maxMessageSize)))
-	t.Cleanup(func() { Params.Reset(Params.PulsarCfg.MaxMessageSize.Key) })
-
 	msgs, err := repackInsertDataWithPartitionKeyForStreamingService(
 		context.Background(),
 		mockCache,
@@ -1480,19 +1318,15 @@ func TestRepackInsertDataWithPartitionKeyForStreamingServiceSplitsOversizedCASMe
 		groups,
 	)
 	require.NoError(t, err)
-	require.Len(t, msgs, 2)
+	require.Len(t, msgs, 1)
+	require.True(t, streamingmessage.HasPartialUpdateCAS(msgs[0]))
+	meta, err := streamingmessage.ExtractPartialUpdateCAS(msgs[0])
+	require.NoError(t, err)
+	require.True(t, proto.Equal(groups[vchannel], meta))
 
-	rowIDs := make([]int64, 0, len(pks))
-	for _, msg := range msgs {
-		require.LessOrEqual(t, msg.EstimateSize(), maxMessageSize)
-		require.True(t, streamingmessage.HasPartialUpdateCAS(msg))
-		meta, err := streamingmessage.ExtractPartialUpdateCAS(msg)
-		require.NoError(t, err)
-		require.True(t, proto.Equal(groups[vchannel], meta))
-		body := streamingmessage.MustAsMutableInsertMessageV1(msg).MustBody()
-		rowIDs = append(rowIDs, body.GetRowIDs()...)
-	}
-	require.Equal(t, []int64{101, 102}, rowIDs)
+	insert := streamingmessage.MustAsMutableInsertMessageV1(msgs[0])
+	require.Equal(t, uint64(len(pks)), insert.Header().GetPartitions()[0].GetRows())
+	require.Equal(t, []int64{101, 102}, insert.MustBody().GetRowIDs())
 }
 
 func TestInsertTaskExecuteSelectsPartitionRouting(t *testing.T) {
@@ -2303,23 +2137,6 @@ func TestAttachPartialUpdateCASAcceptsEveryBuilderMarkedInsertChunk(t *testing.T
 		require.NoError(t, err)
 		require.NotNil(t, meta)
 	}
-}
-
-func TestAttachPartialUpdateCASRejectsOversizedInvariant(t *testing.T) {
-	task, _, _ := partialUpdateCASTestTask(t, true, []int64{10}, []int64{10}, nil)
-	setPartialUpdateCASTestChannels(task, partialUpdateCASTestVChannels[:1])
-	fakeWAL := newPartialUpdateCASTestWAL(t, 9)
-	oldWAL := streaming.WAL()
-	streaming.SetWALForTest(fakeWAL)
-	defer streaming.SetWALForTest(oldWAL)
-	preparePartialUpdateCASTestGroups(t, task)
-	insertMsgs, _ := buildPartialUpdateCASTestMessages(t, task.collectionID, partialUpdateCASTestVChannels[:1], []int64{10}, nil, task.partialUpdateCASGroups)
-
-	require.NoError(t, Params.Save(Params.PulsarCfg.MaxMessageSize.Key, strconv.Itoa(insertMsgs[0].EstimateSize()-1)))
-	defer Params.Reset(Params.PulsarCfg.MaxMessageSize.Key)
-
-	err := task.attachPartialUpdateCAS(insertMsgs)
-	require.ErrorIs(t, err, merr.ErrServiceInternal)
 }
 
 func TestRetrieveByPKs_Success(t *testing.T) {

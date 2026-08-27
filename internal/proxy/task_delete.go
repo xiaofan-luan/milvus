@@ -161,7 +161,6 @@ func repackDeleteMsgByHash(
 	namespace *string,
 	schema *schemapb.CollectionSchema,
 ) (map[uint32][]*msgstream.DeleteMsg, int64, error) {
-	maxSize := Params.PulsarCfg.MaxMessageSize.GetAsInt()
 	var hashValues []uint32
 	// Delete tombstones are PK+timestamp based. Namespace can narrow routing,
 	// but it is not part of the tombstone identity; PKs must stay unique across
@@ -182,16 +181,16 @@ func repackDeleteMsgByHash(
 			return nil, 0, err
 		}
 	}
-	// repack delete msg by dmChannel
+	// repack delete msg by dmChannel. One DeleteMsg per hashed channel: the
+	// streamingnode WAL layer chunks an oversized tombstone batch, so the
+	// proxy never has to bound a message's size.
 	result := make(map[uint32][]*msgstream.DeleteMsg)
-	lastMessageSize := map[uint32]int{}
 
 	numRows := int64(0)
 	numMessage := 0
 
 	createMessage := func(key uint32, vchannel string) *msgstream.DeleteMsg {
 		numMessage++
-		lastMessageSize[key] = 0
 		return &msgstream.DeleteMsg{
 			BaseMsg: msgstream.BaseMsg{
 				Ctx: ctx,
@@ -224,16 +223,11 @@ func repackDeleteMsgByHash(
 			result[key][0] = createMessage(key, vchannel)
 		}
 		curMsg := msgs[len(msgs)-1]
-		size, id := typeutil.GetId(primaryKeys, index)
-		if lastMessageSize[key]+16+size > maxSize {
-			curMsg = createMessage(key, vchannel)
-			result[key] = append(result[key], curMsg)
-		}
+		_, id := typeutil.GetId(primaryKeys, index)
 		curMsg.HashValues = append(curMsg.HashValues, hashValues[index])
 		curMsg.Timestamps = append(curMsg.Timestamps, ts)
 
 		typeutil.AppendID(curMsg.PrimaryKeys, id)
-		lastMessageSize[key] += 16 + size
 		curMsg.NumRows++
 		numRows++
 	}

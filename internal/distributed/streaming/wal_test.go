@@ -9,6 +9,7 @@ import (
 	"github.com/bytedance/mockey"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/atomic"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/msgpb"
@@ -20,6 +21,7 @@ import (
 	streamingcoordclient "github.com/milvus-io/milvus/internal/streamingcoord/client"
 	streamingnodehandler "github.com/milvus-io/milvus/internal/streamingnode/client/handler"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/status"
+	"github.com/milvus-io/milvus/pkg/v3/proto/streamingpb"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/types"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/walimpls/impls/walimplstest"
@@ -192,6 +194,43 @@ func TestReleaseTimeout(t *testing.T) {
 			return false
 		}
 	}, time.Second, 10*time.Millisecond)
+}
+
+func TestCheckStreamingVersion(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		currentVersion int64
+		wantError      bool
+	}{
+		{name: "not ready", currentVersion: types.StreamingVersionChunking - 1, wantError: true},
+		{name: "ready", currentVersion: types.StreamingVersionChunking},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			w, coordClient, _, _ := createMockWAL(t)
+			defer w.Close()
+
+			assignment := mock_client.NewMockAssignmentService(t)
+			coordClient.EXPECT().Assignment().Return(assignment).Once()
+			assignment.EXPECT().AssignmentDiscover(mock.Anything, mock.Anything).RunAndReturn(
+				func(_ context.Context, cb func(*types.VersionedStreamingNodeAssignments) error) error {
+					return cb(&types.VersionedStreamingNodeAssignments{
+						StreamingVersion: &streamingpb.StreamingVersion{Version: test.currentVersion},
+					})
+				}).Once()
+
+			oldSingleton := singleton
+			singleton = w
+			t.Cleanup(func() { singleton = oldSingleton })
+
+			err := CheckStreamingVersion(context.Background(), types.StreamingVersionChunking)
+			if test.wantError {
+				require.Error(t, err)
+				assert.True(t, status.AsStreamingError(err).IsUnrecoverable())
+				return
+			}
+			assert.NoError(t, err)
+		})
+	}
 }
 
 func TestWALAccesserPrepareReleaseManualFlushIfLocal(t *testing.T) {

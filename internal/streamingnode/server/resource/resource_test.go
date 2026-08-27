@@ -1,6 +1,7 @@
 package resource
 
 import (
+	"context"
 	"os"
 	"runtime"
 	"strings"
@@ -33,6 +34,7 @@ func TestInit(t *testing.T) {
 		OptETCD(&clientv3.Client{}),
 		OptMixCoordClient(syncutil.NewFuture[types.MixCoordClient]()),
 		OptStreamingNodeCatalog(mock_metastore.NewMockStreamingNodeCataLog(t)),
+		OptStreamingVersionChecker(func(context.Context, int64) error { return nil }),
 	)
 	assert.NotNil(t, Resource().TSOAllocator())
 	assert.NotNil(t, Resource().ETCD())
@@ -47,6 +49,7 @@ func TestReleaseClosesTimeTickInspector(t *testing.T) {
 		OptETCD(&clientv3.Client{}),
 		OptMixCoordClient(syncutil.NewFuture[types.MixCoordClient]()),
 		OptStreamingNodeCatalog(mock_metastore.NewMockStreamingNodeCataLog(t)),
+		OptStreamingVersionChecker(func(context.Context, int64) error { return nil }),
 	)
 	inspector := Resource().TimeTickInspector()
 	t.Cleanup(inspector.Close)

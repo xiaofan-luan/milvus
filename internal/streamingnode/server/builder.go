@@ -16,12 +16,13 @@ import (
 // ServerBuilder is used to build a server.
 // All component should be initialized before server initialization should be added here.
 type ServerBuilder struct {
-	etcdClient   *clientv3.Client
-	grpcServer   *grpc.Server
-	mixc         *syncutil.Future[types.MixCoordClient]
-	session      *sessionutil.Session
-	kv           kv.MetaKv
-	chunkManager storage.ChunkManager
+	etcdClient              *clientv3.Client
+	grpcServer              *grpc.Server
+	mixc                    *syncutil.Future[types.MixCoordClient]
+	session                 *sessionutil.Session
+	kv                      kv.MetaKv
+	chunkManager            storage.ChunkManager
+	streamingVersionChecker resource.StreamingVersionChecker
 }
 
 // NewServerBuilder creates a new server builder.
@@ -65,6 +66,12 @@ func (b *ServerBuilder) WithMetaKV(kv kv.MetaKv) *ServerBuilder {
 	return b
 }
 
+// WithStreamingVersionChecker sets the cluster streaming capability checker.
+func (b *ServerBuilder) WithStreamingVersionChecker(checker resource.StreamingVersionChecker) *ServerBuilder {
+	b.streamingVersionChecker = checker
+	return b
+}
+
 // Build builds a streaming node server.
 func (b *ServerBuilder) Build() *Server {
 	resource.Init(
@@ -72,6 +79,7 @@ func (b *ServerBuilder) Build() *Server {
 		resource.OptChunkManager(b.chunkManager),
 		resource.OptMixCoordClient(b.mixc),
 		resource.OptStreamingNodeCatalog(streamingnode.NewCataLog(b.kv)),
+		resource.OptStreamingVersionChecker(b.streamingVersionChecker),
 	)
 	s := &Server{
 		session:    b.session,

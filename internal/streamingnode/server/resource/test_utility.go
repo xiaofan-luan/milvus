@@ -4,6 +4,7 @@
 package resource
 
 import (
+	"context"
 	"testing"
 
 	"github.com/milvus-io/milvus/internal/flushcommon/syncmgr"
@@ -27,6 +28,9 @@ func OptWriteBufferManager(wbMgr writebuffer.BufferManager) optResourceInit {
 func InitForTest(t *testing.T, opts ...optResourceInit) {
 	r = &resourceImpl{
 		logger: mlog.With(),
+		streamingVersionChecker: func(context.Context, int64) error {
+			return nil
+		},
 	}
 	for _, opt := range opts {
 		opt(r)
