@@ -24,6 +24,9 @@
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 #include <parquet/arrow/reader.h>
+#include <parquet/schema.h>
+#include <parquet/statistics.h>
+#include <parquet/types.h>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -36,6 +39,7 @@
 #include "common/TracerBase.h"
 #include "common/Types.h"
 #include "gtest/gtest.h"
+#include "index/SkipIndex.h"
 #include "index/skipindex_stats/SkipIndexStats.h"
 #include "storage/Event.h"
 #include "storage/PayloadReader.h"
@@ -76,10 +80,17 @@ TEST_F(SkipIndexStatsBuilderTest, BuildFromArrowBatches) {
         ASSERT_NE(metrics, nullptr);
         EXPECT_EQ(metrics->GetMetricsType(), FieldChunkMetricsType::BOOLEAN);
 
-        std::vector<Metrics> query_true = {true, false};
-        std::vector<Metrics> query_false = {false, true};
-        EXPECT_TRUE(metrics->CanSkipIn(query_true));
-        EXPECT_FALSE(metrics->CanSkipIn(query_false));
+        // Chunk is all-false. CanSkipIn takes the IN-list as a value list
+        // (each entry is one queried value), so a chunk can be skipped only
+        // when none of the listed values can be present.
+        std::vector<Metrics> in_true = {true};  // IN(true): absent -> skip
+        std::vector<Metrics> in_false = {
+            false};  // IN(false): present -> no skip
+        std::vector<Metrics> in_both = {true,
+                                        false};  // false present -> no skip
+        EXPECT_TRUE(metrics->CanSkipIn(in_true));
+        EXPECT_FALSE(metrics->CanSkipIn(in_false));
+        EXPECT_FALSE(metrics->CanSkipIn(in_both));
     }
 
     // INT8
@@ -341,10 +352,15 @@ TEST_F(SkipIndexStatsBuilderTest, BuildFromChunk) {
         ASSERT_NE(metrics, nullptr);
         EXPECT_EQ(metrics->GetMetricsType(), FieldChunkMetricsType::BOOLEAN);
 
-        std::vector<Metrics> query_true = {true, false};
-        std::vector<Metrics> query_false = {false, true};
-        EXPECT_FALSE(metrics->CanSkipIn(query_true));
-        EXPECT_TRUE(metrics->CanSkipIn(query_false));
+        // Chunk is all-true. CanSkipIn takes the IN-list as a value list, so a
+        // chunk can be skipped only when none of the listed values is present.
+        std::vector<Metrics> in_true = {true};  // IN(true): present -> no skip
+        std::vector<Metrics> in_false = {false};  // IN(false): absent -> skip
+        std::vector<Metrics> in_both = {true,
+                                        false};  // true present -> no skip
+        EXPECT_FALSE(metrics->CanSkipIn(in_true));
+        EXPECT_TRUE(metrics->CanSkipIn(in_false));
+        EXPECT_FALSE(metrics->CanSkipIn(in_both));
     }
 
     // INT8
@@ -718,6 +734,16 @@ TEST_F(SkipIndexStatsBuilderTest, BuildFromArrowBatch_InQuery) {
         std::vector<Metrics> in_values6 = {};
         ASSERT_FALSE(metrics->CanSkipIn(in_values6));
     }
+}
+
+TEST_F(SkipIndexStatsBuilderTest, StringInKeepsEmptyStringInQueryHull) {
+    // The chunk range includes the empty string. Treating empty() as an
+    // uninitialized sentinel collapses IN("", "zzz") to ["zzz", "zzz"]
+    // and incorrectly skips this chunk.
+    StringFieldChunkMetrics metrics(
+        "", "banana", /*bloom_filter=*/nullptr, /*ngram_bloom_filter=*/nullptr);
+    std::vector<Metrics> values = {std::string(""), std::string("zzz")};
+    EXPECT_FALSE(metrics.CanSkipIn(values));
 }
 
 TEST_F(SkipIndexStatsBuilderTest, BuildFromArrowBatch_InQuery_Nullable) {
@@ -1111,4 +1137,126 @@ TEST_F(SkipIndexStatsBuilderTest,
         metrics->CanSkipUnaryRange(OpType::PostfixMatch, std::string("zzz")));
     ASSERT_TRUE(
         metrics->CanSkipUnaryRange(OpType::PostfixMatch, std::string("xyz")));
+}
+
+// A statistics object can exist (is_stats_set) yet report no usable min/max --
+// an all-null row group, or a float row group containing NaN. Reading min()/max()
+// then yields garbage bounds that would wrongly prune a matching cell. Build
+// must degrade to NONE metrics (never skips) -- and never crash on a null stats.
+TEST_F(SkipIndexStatsBuilderTest, BuildFromStatisticsWithoutMinMax) {
+    auto make_empty_stats =
+        [](parquet::Type::type physical_type,
+           const std::string& name) -> std::shared_ptr<parquet::Statistics> {
+        auto node = parquet::schema::PrimitiveNode::Make(
+            name, parquet::Repetition::OPTIONAL, physical_type);
+        // OPTIONAL leaf -> max definition level 1, max repetition level 0.
+        auto descr = std::make_shared<parquet::ColumnDescriptor>(
+            node, /*max_definition_level=*/1, /*max_repetition_level=*/0);
+        // No Update(): the statistics object exists but HasMinMax() == false,
+        // exactly as for an all-null or all-NaN row group.
+        return parquet::Statistics::Make(descr.get(),
+                                         arrow::default_memory_pool());
+    };
+
+    {
+        auto stats = make_empty_stats(parquet::Type::DOUBLE, "d");
+        ASSERT_FALSE(stats->HasMinMax());
+        auto metrics = builder_->Build(DataType::DOUBLE, stats);
+        ASSERT_NE(metrics, nullptr);
+        EXPECT_EQ(metrics->GetMetricsType(), FieldChunkMetricsType::NONE);
+        // Garbage bounds would (wrongly) skip; NONE must not prune anything.
+        EXPECT_FALSE(metrics->CanSkipUnaryRange(OpType::GreaterThan, 5.0));
+        EXPECT_FALSE(metrics->CanSkipUnaryRange(OpType::LessThan, -5.0));
+        EXPECT_FALSE(metrics->CanSkipUnaryRange(OpType::Equal, 42.0));
+    }
+    {
+        auto stats = make_empty_stats(parquet::Type::INT64, "i");
+        ASSERT_FALSE(stats->HasMinMax());
+        auto metrics = builder_->Build(DataType::INT64, stats);
+        ASSERT_NE(metrics, nullptr);
+        EXPECT_EQ(metrics->GetMetricsType(), FieldChunkMetricsType::NONE);
+        EXPECT_FALSE(
+            metrics->CanSkipUnaryRange(OpType::GreaterThan, int64_t(1000)));
+        EXPECT_FALSE(metrics->CanSkipUnaryRange(OpType::Equal, int64_t(7)));
+    }
+    {
+        auto stats = make_empty_stats(parquet::Type::BYTE_ARRAY, "s");
+        ASSERT_FALSE(stats->HasMinMax());
+        auto metrics = builder_->Build(DataType::VARCHAR, stats);
+        ASSERT_NE(metrics, nullptr);
+        EXPECT_EQ(metrics->GetMetricsType(), FieldChunkMetricsType::NONE);
+        EXPECT_FALSE(
+            metrics->CanSkipUnaryRange(OpType::Equal, std::string("abc")));
+    }
+    {
+        // Defensive: a null statistics pointer must also yield NONE, not crash.
+        auto metrics = builder_->Build(
+            DataType::INT64, std::shared_ptr<parquet::Statistics>(nullptr));
+        ASSERT_NE(metrics, nullptr);
+        EXPECT_EQ(metrics->GetMetricsType(), FieldChunkMetricsType::NONE);
+    }
+}
+
+TEST_F(SkipIndexStatsBuilderTest,
+       BuildFromStatisticsWithWrongPhysicalTypeFallsBackToNone) {
+    auto node = parquet::schema::PrimitiveNode::Make(
+        "i64", parquet::Repetition::OPTIONAL, parquet::Type::INT64);
+    auto descriptor = std::make_shared<parquet::ColumnDescriptor>(
+        node, /*max_definition_level=*/1, /*max_repetition_level=*/0);
+    auto int64_stats = parquet::MakeStatistics<parquet::Int64Type>(
+        descriptor.get(), arrow::default_memory_pool());
+    const int64_t values[] = {10, 20};
+    int64_stats->Update(values, /*num_values=*/2, /*null_count=*/0);
+    ASSERT_TRUE(int64_stats->HasMinMax());
+
+    // INT32 expects parquet::Int32Type. A malformed/mismatched footer must not
+    // be dereferenced as that type or produce a bound that can drop rows.
+    auto metrics = builder_->Build(DataType::INT32, int64_stats);
+    ASSERT_NE(metrics, nullptr);
+    EXPECT_EQ(metrics->GetMetricsType(), FieldChunkMetricsType::NONE);
+    EXPECT_FALSE(metrics->CanSkipUnaryRange(OpType::Equal, int32_t(15)));
+}
+
+// A minimal FieldChunkMetricsProvider standing in for one immutable column
+// generation: it answers chunk 0 with its own bounds and fails open elsewhere.
+namespace {
+class SingleCellMetricsProvider : public milvus::FieldChunkMetricsProvider {
+ public:
+    SingleCellMetricsProvider(int64_t lower, int64_t upper)
+        : metrics_(lower, upper, nullptr) {
+    }
+
+    const FieldChunkMetrics*
+    GetSkipMetrics(int64_t chunk_id) const override {
+        return chunk_id == 0 ? &metrics_ : nullptr;
+    }
+
+ private:
+    IntFieldChunkMetrics<int64_t> metrics_;
+};
+}  // namespace
+
+TEST_F(SkipIndexStatsBuilderTest,
+       ColumnMetricsViewsKeepGenerationsIsolatedAndFailOpen) {
+    const FieldId field_id(101);
+    auto make_view = [&](int64_t lower, int64_t upper) {
+        auto skip_index = std::make_shared<SkipIndex>();
+        skip_index->LoadSkipSource(
+            field_id,
+            std::make_shared<SingleCellMetricsProvider>(lower, upper));
+        return skip_index;
+    };
+
+    auto old_generation = make_view(0, 10);
+    auto new_generation = make_view(100, 110);
+
+    // Each read view owns its resolver generation. Replacing the column cannot
+    // mutate a previously captured view, and a missing cell remains readable.
+    EXPECT_TRUE(old_generation->CanSkipUnaryRange<int64_t>(
+        field_id, 0, OpType::Equal, int64_t(105)));
+    EXPECT_FALSE(new_generation->CanSkipUnaryRange<int64_t>(
+        field_id, 0, OpType::Equal, int64_t(105)));
+    EXPECT_FALSE(new_generation->CanSkipUnaryRange<int64_t>(
+        field_id, 1, OpType::Equal, int64_t(105)))
+        << "out-of-range chunk ids must conservatively remain readable";
 }
