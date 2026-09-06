@@ -3145,7 +3145,7 @@ func (s *RefreshExternalCollectionTaskSuite) TestBalanceFragmentsToSegments_Samp
 		}).Build()
 	defer m1.UnPatch()
 
-	cppErr := merr.SegcoreError(2042, "Invalid: Column 'wrong_col_a' not found in schema. [path=data.parquet]")
+	cppErr := merr.SegcoreError(2024, "Invalid: Column 'wrong_col_a' not found in schema. [path=data.parquet]")
 	m2 := mockey.Mock(packed.SampleExternalFieldSizes).Return(nil, cppErr).Build()
 	defer m2.UnPatch()
 
@@ -3158,8 +3158,8 @@ func (s *RefreshExternalCollectionTaskSuite) TestBalanceFragmentsToSegments_Samp
 	s.Contains(err.Error(), "Column 'wrong_col_a' not found in schema")
 	// And emit actionable hint guiding the user to the real fix.
 	s.Contains(err.Error(), "external_field mappings")
-	s.Equal(merr.InputError, merr.GetErrorType(err),
-		"the permanent mapping error must remain InputError through task wrapping")
+	s.True(merr.IsSegcoreDataFormatBroken(err),
+		"the permanent data-format code must survive task wrapping")
 }
 
 func (s *RefreshExternalCollectionTaskSuite) TestBalanceFragmentsToSegments_SamplingTypeMismatchFails() {

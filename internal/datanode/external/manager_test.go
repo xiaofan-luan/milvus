@@ -240,6 +240,16 @@ func TestExternalRefreshFailureState(t *testing.T) {
 		assert.Equal(t, indexpb.JobState_JobStateFailed, externalRefreshFailureState(err))
 	})
 
+	t.Run("malformed external data is permanent after wrapping", func(t *testing.T) {
+		err := merr.Wrapf(
+			merr.SegcoreError(2024, "Column 'wrong_col_a' not found in schema"),
+			"external field size sampling failed for segment %d", 100,
+		)
+		assert.Equal(t, merr.SystemError, merr.GetErrorType(err))
+		assert.True(t, merr.IsSegcoreDataFormatBroken(err))
+		assert.Equal(t, indexpb.JobState_JobStateFailed, externalRefreshFailureState(err))
+	})
+
 	t.Run("storage failure remains retryable", func(t *testing.T) {
 		err := merr.SegcoreError(2045, "object store temporarily unavailable")
 		assert.Equal(t, merr.SystemError, merr.GetErrorType(err))

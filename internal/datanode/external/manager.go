@@ -267,10 +267,12 @@ func (m *ExternalCollectionManager) UpdateState(clusterID string, taskID int64, 
 }
 
 // externalRefreshFailureState decides whether a failed refresh attempt is worth
-// another one. Input errors are permanent; system and unknown errors remain
-// retriable and consume the coordinator's attempt budget.
+// another one. Input errors and malformed external data are permanent; other
+// system and unknown errors remain retriable and consume the coordinator's
+// attempt budget.
 func externalRefreshFailureState(err error) indexpb.JobState {
-	if merr.GetErrorType(err) == merr.InputError {
+	if merr.GetErrorType(err) == merr.InputError ||
+		merr.IsSegcoreDataFormatBroken(err) {
 		return indexpb.JobState_JobStateFailed
 	}
 	return indexpb.JobState_JobStateRetry
