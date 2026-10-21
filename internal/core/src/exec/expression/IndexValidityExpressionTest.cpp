@@ -320,6 +320,7 @@ TEST_P(IndexValidityExpressionTest, NullableContainsLeavesBatchOffsetAndMove) {
     auto whole = std::dynamic_pointer_cast<ColumnVector>(output);
     ASSERT_NE(whole, nullptr);
     compare(whole);
+    TargetBitmapView(whole->GetRawData(), rows).flip();
     TargetBitmapView(whole->GetValidRawData(), rows).flip();
     compare(EvalExprInBatches(root, segment.get(), rows).result);
 
@@ -456,8 +457,6 @@ TEST(IndexValidityExpressionFallback, UsesOwnedSnapshotForMutableReader) {
     reader.null_offset = 2;
     auto second = exec::SegmentExpr::CaptureIndexValidity(reader, 1);
     EXPECT_EQ(reader.calls, 2);
-    ASSERT_NE(first.Owned(), nullptr);
-    ASSERT_NE(second.Owned(), nullptr);
     EXPECT_EQ(first.Size(), 3);
     EXPECT_EQ(second.Size(), 3);
     EXPECT_NE(first.View().data(), second.View().data());
@@ -465,30 +464,24 @@ TEST(IndexValidityExpressionFallback, UsesOwnedSnapshotForMutableReader) {
     EXPECT_TRUE(first.View().test(2));
     EXPECT_TRUE(second.View().test(1));
     EXPECT_FALSE(second.View().test(2));
-    std::weak_ptr<TargetBitmap> owner = first.Owned();
     auto retained = first;
     first.Reset();
-    EXPECT_FALSE(owner.expired());
     EXPECT_FALSE(retained.View().test(1));
     retained.Reset();
-    EXPECT_TRUE(owner.expired());
 }
 
-TEST(IndexValidityState, ReplacementKeepsRepresentationLengthAndFactsTogether) {
+TEST(IndexValidityState, ReplacementKeepsRepresentationAndLengthTogether) {
     exec::SegmentExpr::IndexValidity state;
     EXPECT_FALSE(state.Initialized());
     auto owner = std::make_shared<TargetBitmap>(17, false);
     std::weak_ptr<TargetBitmap> weak = owner;
     state.SetOwned(std::move(owner));
     EXPECT_EQ(state.Size(), 17);
-    EXPECT_FALSE(state.IsBorrowed());
-    EXPECT_FALSE(state.AllValid());
+    EXPECT_FALSE(state.Gather({0}).all());
     state.SetBorrowed(BitsetView{}, 130);
     EXPECT_TRUE(weak.expired());
-    EXPECT_TRUE(state.IsBorrowed());
-    EXPECT_EQ(state.Owned(), nullptr);
     EXPECT_EQ(state.Size(), 130);
-    EXPECT_TRUE(state.AllValid());
+    EXPECT_TRUE(state.Gather({0}).all());
     auto all_valid = state.Gather({129, 0, 63, 63});
     EXPECT_EQ(all_valid.size(), 4);
     EXPECT_TRUE(all_valid.all());
@@ -497,44 +490,24 @@ TEST(IndexValidityState, ReplacementKeepsRepresentationLengthAndFactsTogether) {
 
     TargetBitmap all_null(17, false);
     state.SetBorrowed(BitsetView(all_null), 17);
-    EXPECT_FALSE(state.AllValid());
+    EXPECT_FALSE(state.Gather({0}).all());
     EXPECT_EQ(state.Gather({16, 0, 0}).count(), 0);
     EXPECT_ANY_THROW(state.SetBorrowed(BitsetView(all_null), 16));
     EXPECT_EQ(state.Size(), 17);  // A rejected replacement preserves the state.
     state.SetOwned(std::make_shared<TargetBitmap>(5, true));
-    EXPECT_FALSE(state.IsBorrowed());
     EXPECT_EQ(state.Size(), 5);
-    EXPECT_TRUE(state.AllValid());
+    EXPECT_TRUE(state.Gather({0}).all());
     auto copy = state;
     auto moved = std::move(state);
     EXPECT_EQ(copy.View().data(), moved.View().data());
     EXPECT_FALSE(state.Initialized());
     moved.SetOwned(std::make_shared<TargetBitmap>(3, false));
     EXPECT_EQ(moved.Size(), 3);
-    EXPECT_FALSE(moved.AllValid());
+    EXPECT_FALSE(moved.Gather({0}).all());
     EXPECT_EQ(copy.Size(), 5);
-    EXPECT_TRUE(copy.AllValid());
+    EXPECT_TRUE(copy.Gather({0}).all());
     moved.Reset();
     EXPECT_FALSE(moved.Initialized());
-}
-
-TEST(IndexValidityState, TransfersOnlyExclusiveOwnedBuffers) {
-    exec::SegmentExpr::IndexValidity state;
-    state.SetOwned(std::make_shared<TargetBitmap>(130, true));
-    const auto* original = state.View().data();
-    auto shared = state;
-    auto output = state.TakeOwned();
-    EXPECT_FALSE(state.Initialized());
-    EXPECT_NE(reinterpret_cast<const uint8_t*>(output.data()), original);
-    output.reset(65);
-    EXPECT_TRUE(shared.View().test(65));
-    auto transferred = shared.TakeOwned();
-    EXPECT_FALSE(shared.Initialized());
-    EXPECT_EQ(reinterpret_cast<const uint8_t*>(transferred.data()), original);
-    EXPECT_TRUE(transferred.all());
-    state.SetBorrowed(BitsetView{}, 130);
-    EXPECT_ANY_THROW(state.TakeOwned());
-    EXPECT_TRUE(state.Initialized());
 }
 
 TEST(IndexValidityView, AppendsUnalignedWindowsAndAllValidSentinel) {

@@ -46,8 +46,9 @@ from the returned bitmap, not a second reader count that could change during
 concurrent insertion. `IsNotNull()` itself keeps its owned/writable contract.
 
 Knowhere view construction does not scan the bitmap. This API uses only
-`size`, `data`, and `test`; the existing Milvus `all()` check may scan once for
-an expression's offset fast path. No count/filter-ratio cache is assumed.
+`size`, `data`, and `test`. Offset gathers touch only the requested coordinates;
+they do not scan the full bitmap to discover all-valid input. The reader's
+zero-size sentinel already provides that information without a scan.
 
 ## Expression ownership and writes
 
@@ -57,9 +58,9 @@ Expression-private validity uses one state with mutually exclusive forms:
 - an owned snapshot, whose logical length and read view derive from that owner;
 - an uninitialized state.
 
-Assignments replace the representation and clear its cached all-valid fact.
-Copies of owned fallback states retain their owner, without retaining a separate
-raw descriptor into it. Borrowed states remain tied to the expression's existing
+Assignments replace the representation. Copies of owned fallback states retain
+their owner, without retaining a separate raw descriptor into it. This source
+state exposes no writable owner or ownership-transfer operation. Borrowed states remain tied to the expression's existing
 reader pin and are cleared before that pin is released. They are never published
 as an independent result or expression-cache value.
 
@@ -75,45 +76,27 @@ and unordered offsets retain their original order, and bounds use the logical
 length even for an all-valid sentinel. JSON-flat path/type validity keeps its
 existing computation and cache behavior.
 
-The common index-result slicing path transfers a whole hit or owned-validity
-buffer only when its owner is exclusive. A shared owner is cloned before handing
-out writable output; borrowed reader storage is materialized rather than moved.
-Raw-data/statistics caches and cache-enabled evaluation keep their existing
-owned representation. No output
-mutation can modify the borrowed index validity.
+The common index-result slicing path retains the existing whole-buffer move for
+computed query-local bitmaps. Expression-cache reads decode independent bitmaps;
+the result and validity can share a lifetime control block without sharing bytes,
+so `use_count()` alone must not trigger a clone. Reader validity and fallback
+snapshots are copied into output, never moved. Raw-data/statistics caches and
+cache-enabled evaluation keep their existing owned representation and interfaces.
+No output mutation can modify source validity.
 
 ## Boundary toward immutable filtering results
 
-The target execution contract is read-only published inputs and explicit,
-exclusive writable outputs. Expression evaluation still needs writable scratch
-buffers for AND/OR/NOT, NULL-aware three-valued logic, and short-circuiting. An
-exclusive buffer whose input lifetime has ended may be transferred to its parent;
-a shared or borrowed input must be read without modification.
+ColumnVector, logical combiners, FilterBitsNode, and MVCC still use their existing
+mutable-output interfaces. This change only borrows index validity under the
+expression's reader pin; it does not publish ownerless views across operators.
 
-The current ColumnVector, logical combiners, FilterBitsNode, and MVCC operators
-still use their existing mutable-output interfaces. This PR consolidates index
-validity ownership and removes avoidable copies within that boundary. It does
-not establish immutable expression results across operators or caches.
-
-A subsequent interface change must retain ownership, logical length and slice
-coordinates in a published result. A naked BitsetView cannot do that: it does
-not keep its owner alive, and its subview API requires byte alignment. The
-internal validity state here therefore remains private to the pinned expression;
-range copies use bit offsets, without calling the byte-aligned subview API.
-
-For ordinary prefiltering, a query-exclusive destination can read predicate data
-and validity and compute:
-
-```text
-excluded = ~(predicate_data & predicate_validity)
-           | timestamp_excluded | delete_excluded
-```
-
-That design must keep shared delete snapshots read-only. Iterative filtering
-returns verdicts in post-ANN candidate order, and element filtering changes
-between row and element coordinate domains; these require their own exclusive
-outputs rather than reusing the earlier row-level MVCC mask. The global output
-interface migration is a separate change from this index-validity optimization.
+A later migration should publish read-only inputs with their owner and coordinate
+domain, while keeping exclusive writable scratch/output buffers for three-valued
+logic. The final query-owned mask can compute
+`~(predicate_data & predicate_validity) | timestamp_excluded | delete_excluded`.
+Shared delete snapshots must remain read-only. Iterative candidate filtering and
+row/element conversion require separate output domains. Those interfaces belong
+to a separate change.
 
 ## JSON and derived-reader semantics
 
@@ -121,13 +104,7 @@ Field validity, JSON path existence, and typed comparable-value masks are
 different concepts. A derived reader may expose the capability only when its
 view exactly matches its own `IsNotNull()` semantics.
 
-For the 2.6 implementation, ARRAY-cast JSON inverted indexes may delegate to
-their sealed base validity. Scalar JSON inverted indexes, JSON-flat indexes,
-and JSON-flat query executors explicitly decline the capability. TextMatch
-and Ngram readers inherit their existing base validity semantics; unfinalized
-and growing instances continue to fall back.
-
-For master, the sealed inverted reader provides its own coordinate-domain
+The sealed inverted reader provides its own coordinate-domain
 validity. JSON-flat comparable/path-specific readers retain their existing
 owned results. Reader selection must preserve row-versus-element coordinates
 and must not substitute field-level validity for path/type validity.
@@ -152,10 +129,6 @@ No protobuf, persisted index format, public API, or configuration migration is
 required. Unsupported readers use the existing behavior. New native binaries
 must be rebuilt together because this is an internal C++ interface change.
 
-The optimization is independent of ARRAY predicate merging. The 2.6 backport
-must also pass with the original 2.6 parser, not only with a parser that merges
-ARRAY predicates before execution.
-
 ## Validation
 
 - Audit every concrete provider and derived override of `IsNotNull()` to verify
@@ -172,9 +145,8 @@ ARRAY predicates before execution.
 - For master, test full-range materialization and expression-cache fallback,
   including subsequent reads that would expose moved-from shared storage.
 - Replace borrowed, owned, all-valid and all-null states; test copied/moved
-  fallback owners, cached all-valid facts, invalid ranges, and exclusive versus
-  shared whole-range transfers. Check output mutation cannot affect a retained
-  fallback owner.
+  fallback owners and invalid ranges. Check whole-range output mutation cannot
+  affect a retained reader or expression-cache entry.
 - Run focused native index/expression tests and record source revisions,
   dependency configuration, and any unexecuted integration coverage.
 

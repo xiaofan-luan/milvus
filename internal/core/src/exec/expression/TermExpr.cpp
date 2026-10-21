@@ -635,10 +635,10 @@ PhyTermFilterExpr::ExecJsonInVariableByStats() {
         Assert(index.get() != nullptr);
 
         cached_index_chunk_res_ = std::make_shared<TargetBitmap>(active_count_);
-        cached_index_chunk_validity_.SetOwned(
-            std::make_shared<TargetBitmap>(active_count_));
+        cached_index_chunk_valid_res_ =
+            std::make_shared<TargetBitmap>(active_count_);
         TargetBitmapView res_view(*cached_index_chunk_res_);
-        TargetBitmapView valid_res_view(*cached_index_chunk_validity_.Owned());
+        TargetBitmapView valid_res_view(*cached_index_chunk_valid_res_);
 
         // process shredding data
         auto try_execute = [&](milvus::index::JSONType json_type,
@@ -767,7 +767,7 @@ PhyTermFilterExpr::ExecJsonInVariableByStats() {
     }
 
     auto res = MoveOrSliceBitmap(*cached_index_chunk_res_,
-                                 *cached_index_chunk_validity_.Owned(),
+                                 *cached_index_chunk_valid_res_,
                                  current_data_global_pos_,
                                  real_batch_size);
     MoveCursor();

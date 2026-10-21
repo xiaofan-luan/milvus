@@ -1211,10 +1211,10 @@ PhyUnaryRangeFilterExpr::ExecRangeVisitorImplJsonByStats() {
         auto index = segment->GetJsonStats(op_ctx_, field_id);
         Assert(index.get() != nullptr);
         cached_index_chunk_res_ = std::make_shared<TargetBitmap>(active_count_);
-        cached_index_chunk_validity_.SetOwned(
-            std::make_shared<TargetBitmap>(active_count_));
+        cached_index_chunk_valid_res_ =
+            std::make_shared<TargetBitmap>(active_count_);
         TargetBitmapView res_view(*cached_index_chunk_res_);
-        TargetBitmapView valid_res_view(*cached_index_chunk_validity_.Owned());
+        TargetBitmapView valid_res_view(*cached_index_chunk_valid_res_);
 
         // process shredding data
         const auto& numeric_bound = expr_->val_;
@@ -1496,7 +1496,7 @@ PhyUnaryRangeFilterExpr::ExecRangeVisitorImplJsonByStats() {
     }
 
     auto res = MoveOrSliceBitmap(*cached_index_chunk_res_,
-                                 *cached_index_chunk_validity_.Owned(),
+                                 *cached_index_chunk_valid_res_,
                                  current_data_global_pos_,
                                  real_batch_size);
     MoveCursor();
@@ -2372,7 +2372,7 @@ PhyUnaryRangeFilterExpr::ExecTextMatch() {
             },
             enable_sub_expr_cache_write_);
         cached_match_res_ = cached.result;
-        cached_index_chunk_validity_.SetOwned(cached.valid);
+        cached_index_chunk_valid_res_ = cached.valid;
     }
 
     // When execute_all_at_once_ and result is not shared with cache, move to avoid copy
@@ -2380,14 +2380,14 @@ PhyUnaryRangeFilterExpr::ExecTextMatch() {
         MoveCursor();
         return std::make_shared<ColumnVector>(
             std::move(*cached_match_res_),
-            std::move(*cached_index_chunk_validity_.Owned()));
+            std::move(*cached_index_chunk_valid_res_));
     }
 
     TargetBitmap result;
     TargetBitmap valid_result;
     result.append(
         *cached_match_res_, current_data_global_pos_, real_batch_size);
-    valid_result.append(*cached_index_chunk_validity_.Owned(),
+    valid_result.append(*cached_index_chunk_valid_res_,
                         current_data_global_pos_,
                         real_batch_size);
     MoveCursor();
@@ -2605,8 +2605,8 @@ PhyUnaryRangeFilterExpr::ExecFMPatternCandidates(EvalCtx& context) {
                    "count {}",
                    validity.size(),
                    active_count_);
-        cached_index_chunk_validity_.SetOwned(
-            std::make_shared<TargetBitmap>(std::move(validity)));
+        cached_index_chunk_valid_res_ =
+            std::make_shared<TargetBitmap>(std::move(validity));
     }
 
     const int64_t segment_offset = current_index_chunk_pos_;
@@ -2684,7 +2684,7 @@ PhyUnaryRangeFilterExpr::ExecFMPatternCandidates(EvalCtx& context) {
 
     TargetBitmap valid_result;
     valid_result.append(
-        *cached_index_chunk_validity_.Owned(), segment_offset, real_batch_size);
+        *cached_index_chunk_valid_res_, segment_offset, real_batch_size);
     MoveCursor();
     return std::make_shared<ColumnVector>(std::move(batch_candidates),
                                           std::move(valid_result));
@@ -2720,8 +2720,8 @@ PhyUnaryRangeFilterExpr::ExecNgramMatch(EvalCtx& context) {
             literal, ToIndexPatternOp(expr_->op_type_), candidates);
         cached_phase1_res_ =
             std::make_shared<TargetBitmap>(std::move(candidates));
-        cached_index_chunk_validity_.SetOwned(
-            std::make_shared<TargetBitmap>(null_reader_->IsNotNull()));
+        cached_index_chunk_valid_res_ =
+            std::make_shared<TargetBitmap>(null_reader_->IsNotNull());
     }
 
     // Phase 2: Execute per batch with batch-level bitmap_input
@@ -2746,7 +2746,7 @@ PhyUnaryRangeFilterExpr::ExecNgramMatch(EvalCtx& context) {
     }
 
     TargetBitmap valid_result;
-    valid_result.append(*cached_index_chunk_validity_.Owned(),
+    valid_result.append(*cached_index_chunk_valid_res_,
                         current_data_global_pos_,
                         real_batch_size);
     MoveCursor();

@@ -645,10 +645,10 @@ PhyJsonContainsFilterExpr::ExecJsonContainsByStats() {
         Assert(index.get() != nullptr);
 
         cached_index_chunk_res_ = std::make_shared<TargetBitmap>(active_count_);
-        cached_index_chunk_validity_.SetOwned(
-            std::make_shared<TargetBitmap>(active_count_));
+        cached_index_chunk_valid_res_ =
+            std::make_shared<TargetBitmap>(active_count_);
         TargetBitmapView res_view(*cached_index_chunk_res_);
-        TargetBitmapView valid_res_view(*cached_index_chunk_validity_.Owned());
+        TargetBitmapView valid_res_view(*cached_index_chunk_valid_res_);
         // process shredding data for ARRAY type (non-shared)
         {
             milvus::ScopedTimer timer(
@@ -722,7 +722,7 @@ PhyJsonContainsFilterExpr::ExecJsonContainsByStats() {
     }
 
     auto res = MoveOrSliceBitmap(*cached_index_chunk_res_,
-                                 *cached_index_chunk_validity_.Owned(),
+                                 *cached_index_chunk_valid_res_,
                                  current_data_global_pos_,
                                  real_batch_size);
     MoveCursor();
@@ -892,10 +892,10 @@ PhyJsonContainsFilterExpr::ExecJsonContainsArrayByStats() {
         Assert(index.get() != nullptr);
 
         cached_index_chunk_res_ = std::make_shared<TargetBitmap>(active_count_);
-        cached_index_chunk_validity_.SetOwned(
-            std::make_shared<TargetBitmap>(active_count_));
+        cached_index_chunk_valid_res_ =
+            std::make_shared<TargetBitmap>(active_count_);
         TargetBitmapView res_view(*cached_index_chunk_res_);
-        TargetBitmapView valid_res_view(*cached_index_chunk_validity_.Owned());
+        TargetBitmapView valid_res_view(*cached_index_chunk_valid_res_);
 
         // process shredding data for ARRAY type (non-shared)
         {
@@ -963,7 +963,7 @@ PhyJsonContainsFilterExpr::ExecJsonContainsArrayByStats() {
     }
 
     auto res = MoveOrSliceBitmap(*cached_index_chunk_res_,
-                                 *cached_index_chunk_validity_.Owned(),
+                                 *cached_index_chunk_valid_res_,
                                  current_data_global_pos_,
                                  real_batch_size);
     MoveCursor();
@@ -1341,10 +1341,10 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAllByStats() {
         Assert(index.get() != nullptr);
 
         cached_index_chunk_res_ = std::make_shared<TargetBitmap>(active_count_);
-        cached_index_chunk_validity_.SetOwned(
-            std::make_shared<TargetBitmap>(active_count_));
+        cached_index_chunk_valid_res_ =
+            std::make_shared<TargetBitmap>(active_count_);
         TargetBitmapView res_view(*cached_index_chunk_res_);
-        TargetBitmapView valid_res_view(*cached_index_chunk_validity_.Owned());
+        TargetBitmapView valid_res_view(*cached_index_chunk_valid_res_);
         // process shredding data for ARRAY type (non-shared)
         {
             milvus::ScopedTimer timer(
@@ -1455,7 +1455,7 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAllByStats() {
     }
 
     auto res = MoveOrSliceBitmap(*cached_index_chunk_res_,
-                                 *cached_index_chunk_validity_.Owned(),
+                                 *cached_index_chunk_valid_res_,
                                  current_data_global_pos_,
                                  real_batch_size);
     MoveCursor();
@@ -1680,10 +1680,10 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAllWithDiffTypeByStats() {
         Assert(index.get() != nullptr);
 
         cached_index_chunk_res_ = std::make_shared<TargetBitmap>(active_count_);
-        cached_index_chunk_validity_.SetOwned(
-            std::make_shared<TargetBitmap>(active_count_));
+        cached_index_chunk_valid_res_ =
+            std::make_shared<TargetBitmap>(active_count_);
         TargetBitmapView res_view(*cached_index_chunk_res_);
-        TargetBitmapView valid_res_view(*cached_index_chunk_validity_.Owned());
+        TargetBitmapView valid_res_view(*cached_index_chunk_valid_res_);
 
         // process shredding data for ARRAY type (non-shared)
         {
@@ -1812,7 +1812,7 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAllWithDiffTypeByStats() {
     }
 
     auto res = MoveOrSliceBitmap(*cached_index_chunk_res_,
-                                 *cached_index_chunk_validity_.Owned(),
+                                 *cached_index_chunk_valid_res_,
                                  current_data_global_pos_,
                                  real_batch_size);
     MoveCursor();
@@ -1983,10 +1983,10 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAllArrayByStats() {
         Assert(index.get() != nullptr);
 
         cached_index_chunk_res_ = std::make_shared<TargetBitmap>(active_count_);
-        cached_index_chunk_validity_.SetOwned(
-            std::make_shared<TargetBitmap>(active_count_));
+        cached_index_chunk_valid_res_ =
+            std::make_shared<TargetBitmap>(active_count_);
         TargetBitmapView res_view(*cached_index_chunk_res_);
-        TargetBitmapView valid_res_view(*cached_index_chunk_validity_.Owned());
+        TargetBitmapView valid_res_view(*cached_index_chunk_valid_res_);
 
         // process shredding data for ARRAY type (non-shared)
         {
@@ -2059,7 +2059,7 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAllArrayByStats() {
     }
 
     auto res = MoveOrSliceBitmap(*cached_index_chunk_res_,
-                                 *cached_index_chunk_validity_.Owned(),
+                                 *cached_index_chunk_valid_res_,
                                  current_data_global_pos_,
                                  real_batch_size);
     MoveCursor();
@@ -2266,10 +2266,10 @@ PhyJsonContainsFilterExpr::ExecJsonContainsWithDiffTypeByStats() {
         Assert(index.get() != nullptr);
 
         cached_index_chunk_res_ = std::make_shared<TargetBitmap>(active_count_);
-        cached_index_chunk_validity_.SetOwned(
-            std::make_shared<TargetBitmap>(active_count_));
+        cached_index_chunk_valid_res_ =
+            std::make_shared<TargetBitmap>(active_count_);
         TargetBitmapView res_view(*cached_index_chunk_res_);
-        TargetBitmapView valid_res_view(*cached_index_chunk_validity_.Owned());
+        TargetBitmapView valid_res_view(*cached_index_chunk_valid_res_);
 
         // process shredding data for ARRAY type (non-shared)
         {
@@ -2389,7 +2389,7 @@ PhyJsonContainsFilterExpr::ExecJsonContainsWithDiffTypeByStats() {
     }
 
     auto res = MoveOrSliceBitmap(*cached_index_chunk_res_,
-                                 *cached_index_chunk_validity_.Owned(),
+                                 *cached_index_chunk_valid_res_,
                                  current_data_global_pos_,
                                  real_batch_size);
     MoveCursor();

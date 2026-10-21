@@ -1072,7 +1072,7 @@ class SegmentExpr : public Expr {
             got.active_count = active_count_;
             if (manager.Get(key, got)) {
                 cached_index_chunk_res_ = got.result;
-                cached_index_chunk_validity_.SetOwned(got.valid_result);
+                cached_index_chunk_valid_res_ = got.valid_result;
                 cached_index_chunk_id_ = 0;
                 cache_hit = true;
             }
@@ -1087,7 +1087,7 @@ class SegmentExpr : public Expr {
         if (!ExprResCacheManager::IsEnabled() || segment_ == nullptr) {
             return;
         }
-        if (!cached_index_chunk_res_ || !cached_index_chunk_validity_.Owned()) {
+        if (!cached_index_chunk_res_ || !cached_index_chunk_valid_res_) {
             return;
         }
         RunExprCacheBestEffort([&]() {
@@ -1099,7 +1099,7 @@ class SegmentExpr : public Expr {
                                          this->ToString()};
             ExprResCacheManager::Value v;
             v.result = cached_index_chunk_res_;
-            v.valid_result = cached_index_chunk_validity_.Owned();
+            v.valid_result = cached_index_chunk_valid_res_;
             v.active_count = active_count_;
             v.eval_duration_us = eval_duration_us;
             manager.Put(key, v);
@@ -1119,18 +1119,17 @@ class SegmentExpr : public Expr {
     // Expression-private validity: either a pinned reader view with its logical
     // length, or an owned snapshot. No descriptor is retained into owned data,
     // so copying/moving this state cannot leave a view pointing at an old owner.
-    // Owned buffers may be filled before reading; once read, keep them stable.
     class IndexValidity {
      public:
         bool
         Initialized() const {
-            return Owned() != nullptr || IsBorrowed();
+            return Owned() != nullptr ||
+                   std::holds_alternative<Borrowed>(storage_);
         }
 
         void
-        SetOwned(std::shared_ptr<TargetBitmap> bitmap) {
+        SetOwned(std::shared_ptr<const TargetBitmap> bitmap) {
             storage_ = std::move(bitmap);
-            all_valid_.reset();
         }
 
         void
@@ -1142,26 +1141,11 @@ class SegmentExpr : public Expr {
                        view.size(),
                        count);
             storage_ = Borrowed{std::move(view), count};
-            all_valid_.reset();
         }
 
         void
         Reset() {
             storage_ = std::monostate{};
-            all_valid_.reset();
-        }
-
-        bool
-        IsBorrowed() const {
-            return std::holds_alternative<Borrowed>(storage_);
-        }
-
-        const std::shared_ptr<TargetBitmap>&
-        Owned() const {
-            static const std::shared_ptr<TargetBitmap> empty;
-            const auto* owner =
-                std::get_if<std::shared_ptr<TargetBitmap>>(&storage_);
-            return owner != nullptr ? *owner : empty;
         }
 
         int64_t
@@ -1183,32 +1167,10 @@ class SegmentExpr : public Expr {
                               Owned()->size());
         }
 
-        bool
-        AllValid() const {
-            if (!all_valid_.has_value()) {
-                const auto view = View();
-                all_valid_ = view.size() == 0 || view.all();
-            }
-            return *all_valid_;
-        }
-
-        // Transfer only an exclusive buffer; a fallback may also be retained
-        // by another expression-local validity state or a published cache entry.
-        TargetBitmap
-        TakeOwned() {
-            const auto& owner = Owned();
-            AssertInfo(owner != nullptr, "cannot transfer borrowed validity");
-            TargetBitmap result =
-                owner.use_count() == 1 ? std::move(*owner) : owner->clone();
-            Reset();
-            return result;
-        }
-
         TargetBitmap
         Gather(const OffsetVector& offsets) const {
             const auto count = Size();
             const auto view = View();
-            const bool all_valid = AllValid();
             TargetBitmap result(offsets.size(), true);
             for (size_t i = 0; i < offsets.size(); ++i) {
                 const auto offset = offsets[i];
@@ -1216,7 +1178,7 @@ class SegmentExpr : public Expr {
                            "validity offset {} is outside {} coordinates",
                            offset,
                            count);
-                if (!all_valid) {
+                if (view.size() != 0) {
                     result[i] = view.test(offset);
                 }
             }
@@ -1224,13 +1186,21 @@ class SegmentExpr : public Expr {
         }
 
      private:
+        const TargetBitmap*
+        Owned() const {
+            const auto* owner =
+                std::get_if<std::shared_ptr<const TargetBitmap>>(&storage_);
+            return owner != nullptr ? owner->get() : nullptr;
+        }
+
         struct Borrowed {
             BitsetView view;
             int64_t count;
         };
-        std::variant<std::monostate, std::shared_ptr<TargetBitmap>, Borrowed>
+        std::variant<std::monostate,
+                     std::shared_ptr<const TargetBitmap>,
+                     Borrowed>
             storage_;
-        mutable std::optional<bool> all_valid_;
     };
 
     // Borrowed states stay private to the expression's reader pin. Fallback
@@ -1412,21 +1382,23 @@ class SegmentExpr : public Expr {
 
     int64_t
     CachedIndexValiditySize() const {
-        return cached_index_chunk_validity_.Size();
+        return cached_index_chunk_valid_res_
+                   ? cached_index_chunk_valid_res_->size()
+                   : cached_index_validity_.Size();
     }
 
     void
     AppendCachedIndexValidity(TargetBitmap& result,
                               int64_t offset,
                               int64_t count) const {
-        if (cached_index_chunk_validity_.IsBorrowed()) {
+        if (cached_index_chunk_valid_res_) {
+            result.append(*cached_index_chunk_valid_res_, offset, count);
+        } else {
             AppendValidityView(result,
-                               cached_index_chunk_validity_.View(),
-                               cached_index_chunk_validity_.Size(),
+                               cached_index_validity_.View(),
+                               cached_index_validity_.Size(),
                                offset,
                                count);
-        } else {
-            result.append(*cached_index_chunk_validity_.Owned(), offset, count);
         }
     }
 
@@ -1467,18 +1439,16 @@ class SegmentExpr : public Expr {
                    int64_t(cached_index_chunk_res_->size()) == active_count_ &&
                    int64_t(CachedIndexValiditySize()) == active_count_) {
             current_index_chunk_pos_ += cached_index_chunk_res_->size();
-            auto owned_result = cached_index_chunk_res_.use_count() == 1
-                                    ? std::move(*cached_index_chunk_res_)
-                                    : cached_index_chunk_res_->clone();
-            if (cached_index_chunk_validity_.IsBorrowed()) {
-                // Shared reader validity is never moved or exposed writable.
+            if (cached_index_chunk_valid_res_) {
+                // Expression-cache reads decode into query-local bitmaps.
+                // result/validity can share a control block without sharing bytes.
+                valid = std::move(*cached_index_chunk_valid_res_);
+            } else {
+                // Reader views and fallback snapshots remain read-only.
                 AppendCachedIndexValidity(valid, 0, active_count_);
-                return std::make_shared<ColumnVector>(std::move(owned_result),
-                                                      std::move(valid));
             }
             return std::make_shared<ColumnVector>(
-                std::move(owned_result),
-                cached_index_chunk_validity_.TakeOwned());
+                std::move(*cached_index_chunk_res_), std::move(valid));
         } else {
             const auto data_pos = current_index_chunk_pos_;
             const auto size = std::min(active_count_ - data_pos, batch_size_);
@@ -1517,7 +1487,7 @@ class SegmentExpr : public Expr {
                        "selected value index has negative coordinate count");
             cached_index_chunk_res_ = std::make_shared<TargetBitmap>(
                 func(reader, static_cast<size_t>(value_count), values...));
-            cached_index_chunk_validity_ = GetCachedIndexValidity();
+            GetCachedIndexValidity();
             AssertInfo(
                 cached_index_chunk_res_->size() ==
                     static_cast<size_t>(value_count),
@@ -3190,7 +3160,7 @@ class SegmentExpr : public Expr {
                 null_reader_ != nullptr) {
                 const auto validity = null_reader_->GetValidityView();
                 if (validity) {
-                    cached_index_chunk_validity_.SetBorrowed(
+                    cached_index_validity_.SetBorrowed(
                         *validity, selected_reader_->Count());
                     cached_index_chunk_res_ = std::make_shared<TargetBitmap>(
                         func(predicate, values...));
@@ -3294,7 +3264,7 @@ class SegmentExpr : public Expr {
                     return {std::move(res), std::move(valid_res)};
                 });
             cached_index_chunk_res_ = cached.result;
-            cached_index_chunk_validity_.SetOwned(cached.valid);
+            cached_index_chunk_valid_res_ = cached.valid;
             cached_index_chunk_id_ = 0;
         }
 
@@ -3311,9 +3281,14 @@ class SegmentExpr : public Expr {
                        "index result size {} does not match row count {}",
                        cached_index_chunk_res_->size(),
                        active_count_);
-            return GatherCachedResultByOffsets(*cached_index_chunk_res_,
-                                               cached_index_chunk_validity_,
-                                               *offsets);
+            if (cached_index_chunk_valid_res_) {
+                return GatherCachedResultByOffsets(
+                    *cached_index_chunk_res_,
+                    *cached_index_chunk_valid_res_,
+                    *offsets);
+            }
+            return GatherCachedResultByOffsets(
+                *cached_index_chunk_res_, cached_index_validity_, *offsets);
         }
         return SliceCachedIndexResult(need_element_slicing);
     }
@@ -3547,8 +3522,7 @@ class SegmentExpr : public Expr {
         if (cached_index_chunk_id_ != 0) {
             AssertInfo(null_reader_ != nullptr,
                        "selected index does not expose null predicates");
-            cached_index_chunk_validity_ =
-                CaptureIndexValidity(*null_reader_, selected_reader_->Count());
+            GetCachedIndexValidity();
             cached_index_chunk_id_ = 0;
         }
 
@@ -3720,7 +3694,7 @@ class SegmentExpr : public Expr {
     ClearSelectedIndex() {
         // Drop borrowed descriptors before releasing their reader pins.
         cached_index_validity_.Reset();
-        cached_index_chunk_validity_.Reset();
+        cached_index_chunk_valid_res_.reset();
         selected_json_view_ = {};
         selected_reader_ = nullptr;
         json_reader_ = nullptr;
@@ -4419,11 +4393,11 @@ class SegmentExpr : public Expr {
     // The same state represents reader borrowing and owned fallback snapshots.
     IndexValidity cached_index_validity_;
 
-    // Legacy hit cache remains separate; validity has a single representation
-    // for borrowed readers, fallback snapshots, and expression-cache owners.
+    // Computed/cache-owned validity keeps the existing writable representation.
+    // When absent, index slicing reads cached_index_validity_ instead.
     int64_t cached_index_chunk_id_{-1};
     std::shared_ptr<TargetBitmap> cached_index_chunk_res_{nullptr};
-    IndexValidity cached_index_chunk_validity_;
+    std::shared_ptr<TargetBitmap> cached_index_chunk_valid_res_{nullptr};
     bool cached_is_nested_index_{false};
     std::shared_ptr<TargetBitmap> cached_match_res_{nullptr};
 

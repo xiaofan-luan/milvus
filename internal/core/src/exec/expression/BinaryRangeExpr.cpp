@@ -459,8 +459,8 @@ PhyBinaryRangeFilterExpr::ExecRangeVisitorImplForIndex(OffsetVector* input) {
                 cached_result_->size(),
                 active_count_);
         }
-        const auto& validity = GetCachedIndexValidity();
-        return GatherCachedResultByOffsets(*cached_result_, validity, *input);
+        return GatherCachedResultByOffsets(
+            *cached_result_, GetCachedIndexValidity(), *input);
     }
     auto res = ProcessIndexChunks<T>(execute_sub_batch, val1, val2);
     AssertInfo(res->size() == real_batch_size,
@@ -817,10 +817,10 @@ PhyBinaryRangeFilterExpr::ExecRangeVisitorImplForJsonStats(
         Assert(index.get() != nullptr);
 
         cached_index_chunk_res_ = std::make_shared<TargetBitmap>(active_count_);
-        cached_index_chunk_validity_.SetOwned(
-            std::make_shared<TargetBitmap>(active_count_));
+        cached_index_chunk_valid_res_ =
+            std::make_shared<TargetBitmap>(active_count_);
         TargetBitmapView res_view(*cached_index_chunk_res_);
-        TargetBitmapView valid_res_view(*cached_index_chunk_validity_.Owned());
+        TargetBitmapView valid_res_view(*cached_index_chunk_valid_res_);
 
         // process shredding data
         const auto& lower_bound = expr_->lower_val_;
@@ -991,12 +991,10 @@ PhyBinaryRangeFilterExpr::ExecRangeVisitorImplForJsonStats(
 
     if (input != nullptr) {
         return GatherCachedResultByOffsets(
-            *cached_index_chunk_res_,
-            *cached_index_chunk_validity_.Owned(),
-            *input);
+            *cached_index_chunk_res_, *cached_index_chunk_valid_res_, *input);
     }
     auto res = MoveOrSliceBitmap(*cached_index_chunk_res_,
-                                 *cached_index_chunk_validity_.Owned(),
+                                 *cached_index_chunk_valid_res_,
                                  current_data_global_pos_,
                                  real_batch_size);
     MoveCursor();
