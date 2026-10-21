@@ -51,16 +51,69 @@ an expression's offset fast path. No count/filter-ratio cache is assumed.
 
 ## Expression ownership and writes
 
-An expression caches the borrowed view and logical coordinate count. Batches
-copy the requested range into independent writable output with the existing
-bit-copy primitive. All-valid output is extended with true bits. Non-aligned
+Expression-private validity uses one state with mutually exclusive forms:
+
+- a borrowed reader view together with its logical coordinate count;
+- an owned snapshot, whose logical length and read view derive from that owner;
+- an uninitialized state.
+
+Assignments replace the representation and clear its cached all-valid fact.
+Copies of owned fallback states retain their owner, without retaining a separate
+raw descriptor into it. Borrowed states remain tied to the expression's existing
+reader pin and are cleared before that pin is released. They are never published
+as an independent result or expression-cache value.
+
+Batches copy only the requested range into independent writable output with the
+existing bit-copy primitive. All-valid output is extended with true bits. Non-aligned
 prefixes and suffixes retain neighboring bits, and range checks use the logical
 length, including the all-valid sentinel case.
 
-Whole-range execution may move its local hit bitmap, but it materializes valid
-output rather than moving reader storage. Raw-data/statistics caches and
-cache-enabled evaluation keep their existing owned representation. No output
+Offset evaluation gathers directly from the state, including BinaryRange's
+non-flat JSON index path. It retains the full hit bitmap needed by repeated
+batches, but does not create an additional full-segment validity copy. Repeated
+and unordered offsets retain their original order, and bounds use the logical
+length even for an all-valid sentinel. JSON-flat path/type validity keeps its
+existing computation and cache behavior.
+
+The common index-result slicing path transfers a whole hit or owned-validity
+buffer only when its owner is exclusive. A shared owner is cloned before handing
+out writable output; borrowed reader storage is materialized rather than moved.
+Raw-data/statistics caches and cache-enabled evaluation keep their existing
+owned representation. No output
 mutation can modify the borrowed index validity.
+
+## Boundary toward immutable filtering results
+
+The target execution contract is read-only published inputs and explicit,
+exclusive writable outputs. Expression evaluation still needs writable scratch
+buffers for AND/OR/NOT, NULL-aware three-valued logic, and short-circuiting. An
+exclusive buffer whose input lifetime has ended may be transferred to its parent;
+a shared or borrowed input must be read without modification.
+
+The current ColumnVector, logical combiners, FilterBitsNode, and MVCC operators
+still use their existing mutable-output interfaces. This PR consolidates index
+validity ownership and removes avoidable copies within that boundary. It does
+not establish immutable expression results across operators or caches.
+
+A subsequent interface change must retain ownership, logical length and slice
+coordinates in a published result. A naked BitsetView cannot do that: it does
+not keep its owner alive, and its subview API requires byte alignment. The
+internal validity state here therefore remains private to the pinned expression;
+range copies use bit offsets, without calling the byte-aligned subview API.
+
+For ordinary prefiltering, a query-exclusive destination can read predicate data
+and validity and compute:
+
+```text
+excluded = ~(predicate_data & predicate_validity)
+           | timestamp_excluded | delete_excluded
+```
+
+That design must keep shared delete snapshots read-only. Iterative filtering
+returns verdicts in post-ANN candidate order, and element filtering changes
+between row and element coordinate domains; these require their own exclusive
+outputs rather than reusing the earlier row-level MVCC mask. The global output
+interface migration is a separate change from this index-validity optimization.
 
 ## JSON and derived-reader semantics
 
@@ -118,6 +171,10 @@ ARRAY predicates before execution.
   predicates. Exercise growing and JSON path/type fallback behavior.
 - For master, test full-range materialization and expression-cache fallback,
   including subsequent reads that would expose moved-from shared storage.
+- Replace borrowed, owned, all-valid and all-null states; test copied/moved
+  fallback owners, cached all-valid facts, invalid ranges, and exclusive versus
+  shared whole-range transfers. Check output mutation cannot affect a retained
+  fallback owner.
 - Run focused native index/expression tests and record source revisions,
   dependency configuration, and any unexecuted integration coverage.
 

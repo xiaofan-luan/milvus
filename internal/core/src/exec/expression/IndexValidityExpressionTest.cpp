@@ -344,12 +344,12 @@ TEST_P(IndexValidityExpressionTest, NullableContainsLeavesBatchOffsetAndMove) {
 }
 
 TEST_P(IndexValidityExpressionTest,
-       BinaryRangeOffsetsMaterializeAllValidAndReuseOwnedCache) {
+       BinaryRangeOffsetsGatherValidityWithoutFullCopy) {
     constexpr int64_t rows = 33;
     for (bool has_nulls : {false, true}) {
         SCOPED_TRACE(has_nulls ? "has-nulls" : "all-valid");
         // Scalar offsets always scan raw data. A typed JSON-path index routes
-        // offset ranges to ExecRangeVisitorImplForIndex, the owned-cache branch
+        // offset ranges to ExecRangeVisitorImplForIndex, the borrowed-validity branch
         // under regression. Keep raw JSON unloaded so raw fallback cannot pass.
         auto schema = std::make_shared<Schema>();
         auto pk = schema->AddDebugField("pk", DataType::INT64);
@@ -416,8 +416,8 @@ TEST_P(IndexValidityExpressionTest,
                         << "row=" << row;
                 }
             }
-            // The second Eval reuses this exact compiled expression's owned
-            // full-range cache, not the output batch that the caller can write.
+            // Repeated Eval reads the retained hits and pinned validity directly;
+            // callers can mutate their own output without changing either.
             valid.flip();
             ASSERT_EQ(calls->owners.size(), 1);
             EXPECT_EQ(calls->owned, 0);
@@ -450,18 +450,91 @@ TEST(IndexValidityExpressionFallback, UsesOwnedSnapshotForMutableReader) {
         mutable int calls = 0;
         int null_offset = 1;
     } reader;
-    std::shared_ptr<TargetBitmap> first_owner, second_owner;
-    auto first = exec::SegmentExpr::GetIndexValidityView(reader, first_owner);
+    // Fallback snapshots determine their own length even if a mutable reader's
+    // separately sampled count disagrees. Copies retain that snapshot's owner.
+    auto first = exec::SegmentExpr::CaptureIndexValidity(reader, 100);
     reader.null_offset = 2;
-    auto second = exec::SegmentExpr::GetIndexValidityView(reader, second_owner);
+    auto second = exec::SegmentExpr::CaptureIndexValidity(reader, 1);
     EXPECT_EQ(reader.calls, 2);
-    ASSERT_NE(first_owner, nullptr);
-    ASSERT_NE(second_owner, nullptr);
-    EXPECT_NE(first.data(), second.data());
-    EXPECT_FALSE(first.test(1));
-    EXPECT_TRUE(first.test(2));
-    EXPECT_TRUE(second.test(1));
-    EXPECT_FALSE(second.test(2));
+    ASSERT_NE(first.Owned(), nullptr);
+    ASSERT_NE(second.Owned(), nullptr);
+    EXPECT_EQ(first.Size(), 3);
+    EXPECT_EQ(second.Size(), 3);
+    EXPECT_NE(first.View().data(), second.View().data());
+    EXPECT_FALSE(first.View().test(1));
+    EXPECT_TRUE(first.View().test(2));
+    EXPECT_TRUE(second.View().test(1));
+    EXPECT_FALSE(second.View().test(2));
+    std::weak_ptr<TargetBitmap> owner = first.Owned();
+    auto retained = first;
+    first.Reset();
+    EXPECT_FALSE(owner.expired());
+    EXPECT_FALSE(retained.View().test(1));
+    retained.Reset();
+    EXPECT_TRUE(owner.expired());
+}
+
+TEST(IndexValidityState, ReplacementKeepsRepresentationLengthAndFactsTogether) {
+    exec::SegmentExpr::IndexValidity state;
+    EXPECT_FALSE(state.Initialized());
+    auto owner = std::make_shared<TargetBitmap>(17, false);
+    std::weak_ptr<TargetBitmap> weak = owner;
+    state.SetOwned(std::move(owner));
+    EXPECT_EQ(state.Size(), 17);
+    EXPECT_FALSE(state.IsBorrowed());
+    EXPECT_FALSE(state.AllValid());
+    state.SetBorrowed(BitsetView{}, 130);
+    EXPECT_TRUE(weak.expired());
+    EXPECT_TRUE(state.IsBorrowed());
+    EXPECT_EQ(state.Owned(), nullptr);
+    EXPECT_EQ(state.Size(), 130);
+    EXPECT_TRUE(state.AllValid());
+    auto all_valid = state.Gather({129, 0, 63, 63});
+    EXPECT_EQ(all_valid.size(), 4);
+    EXPECT_TRUE(all_valid.all());
+    EXPECT_ANY_THROW(state.Gather({130}));
+    EXPECT_ANY_THROW(state.Gather({-1}));
+
+    TargetBitmap all_null(17, false);
+    state.SetBorrowed(BitsetView(all_null), 17);
+    EXPECT_FALSE(state.AllValid());
+    EXPECT_EQ(state.Gather({16, 0, 0}).count(), 0);
+    EXPECT_ANY_THROW(state.SetBorrowed(BitsetView(all_null), 16));
+    EXPECT_EQ(state.Size(), 17);  // A rejected replacement preserves the state.
+    state.SetOwned(std::make_shared<TargetBitmap>(5, true));
+    EXPECT_FALSE(state.IsBorrowed());
+    EXPECT_EQ(state.Size(), 5);
+    EXPECT_TRUE(state.AllValid());
+    auto copy = state;
+    auto moved = std::move(state);
+    EXPECT_EQ(copy.View().data(), moved.View().data());
+    EXPECT_FALSE(state.Initialized());
+    moved.SetOwned(std::make_shared<TargetBitmap>(3, false));
+    EXPECT_EQ(moved.Size(), 3);
+    EXPECT_FALSE(moved.AllValid());
+    EXPECT_EQ(copy.Size(), 5);
+    EXPECT_TRUE(copy.AllValid());
+    moved.Reset();
+    EXPECT_FALSE(moved.Initialized());
+}
+
+TEST(IndexValidityState, TransfersOnlyExclusiveOwnedBuffers) {
+    exec::SegmentExpr::IndexValidity state;
+    state.SetOwned(std::make_shared<TargetBitmap>(130, true));
+    const auto* original = state.View().data();
+    auto shared = state;
+    auto output = state.TakeOwned();
+    EXPECT_FALSE(state.Initialized());
+    EXPECT_NE(reinterpret_cast<const uint8_t*>(output.data()), original);
+    output.reset(65);
+    EXPECT_TRUE(shared.View().test(65));
+    auto transferred = shared.TakeOwned();
+    EXPECT_FALSE(shared.Initialized());
+    EXPECT_EQ(reinterpret_cast<const uint8_t*>(transferred.data()), original);
+    EXPECT_TRUE(transferred.all());
+    state.SetBorrowed(BitsetView{}, 130);
+    EXPECT_ANY_THROW(state.TakeOwned());
+    EXPECT_TRUE(state.Initialized());
 }
 
 TEST(IndexValidityView, AppendsUnalignedWindowsAndAllValidSentinel) {

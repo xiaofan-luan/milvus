@@ -453,23 +453,14 @@ PhyBinaryRangeFilterExpr::ExecRangeVisitorImplForIndex(OffsetVector* input) {
             AssertInfo(reader != nullptr, "invalid scalar predicate type");
             cached_result_ = std::make_shared<TargetBitmap>(
                 execute_sub_batch(reader, val1, val2));
-            const auto& validity = GetCachedIndexValidBitmap();
-            cached_valid_result_ = std::make_shared<TargetBitmap>();
-            // This offset cache retains owned output. The borrowed all-valid
-            // sentinel has size zero; materialize the cached coordinate count.
-            AppendValidityView(*cached_valid_result_,
-                               validity,
-                               cached_index_valid_count_,
-                               0,
-                               cached_index_valid_count_);
             AssertInfo(
                 cached_result_->size() == static_cast<size_t>(active_count_),
                 "index range result size {} does not match row count {}",
                 cached_result_->size(),
                 active_count_);
         }
-        return GatherCachedResultByOffsets(
-            *cached_result_, *cached_valid_result_, *input);
+        const auto& validity = GetCachedIndexValidity();
+        return GatherCachedResultByOffsets(*cached_result_, validity, *input);
     }
     auto res = ProcessIndexChunks<T>(execute_sub_batch, val1, val2);
     AssertInfo(res->size() == real_batch_size,
@@ -826,10 +817,10 @@ PhyBinaryRangeFilterExpr::ExecRangeVisitorImplForJsonStats(
         Assert(index.get() != nullptr);
 
         cached_index_chunk_res_ = std::make_shared<TargetBitmap>(active_count_);
-        cached_index_chunk_valid_res_ =
-            std::make_shared<TargetBitmap>(active_count_);
+        cached_index_chunk_validity_.SetOwned(
+            std::make_shared<TargetBitmap>(active_count_));
         TargetBitmapView res_view(*cached_index_chunk_res_);
-        TargetBitmapView valid_res_view(*cached_index_chunk_valid_res_);
+        TargetBitmapView valid_res_view(*cached_index_chunk_validity_.Owned());
 
         // process shredding data
         const auto& lower_bound = expr_->lower_val_;
@@ -1000,10 +991,12 @@ PhyBinaryRangeFilterExpr::ExecRangeVisitorImplForJsonStats(
 
     if (input != nullptr) {
         return GatherCachedResultByOffsets(
-            *cached_index_chunk_res_, *cached_index_chunk_valid_res_, *input);
+            *cached_index_chunk_res_,
+            *cached_index_chunk_validity_.Owned(),
+            *input);
     }
     auto res = MoveOrSliceBitmap(*cached_index_chunk_res_,
-                                 *cached_index_chunk_valid_res_,
+                                 *cached_index_chunk_validity_.Owned(),
                                  current_data_global_pos_,
                                  real_batch_size);
     MoveCursor();
