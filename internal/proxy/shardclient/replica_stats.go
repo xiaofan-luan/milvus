@@ -79,6 +79,32 @@ func (s *replicaStats) succeed(now time.Time, latency, decay time.Duration) {
 	s.failures = 0
 }
 
+// refusalLatencyFactor is how many queue wait limits a refusal counts as.
+const refusalLatencyFactor = 2
+
+// refuse records an attempt that the replica refused as overloaded. limit is
+// how long the attempt was allowed to wait in the queue there. Without a
+// record a replica that refuses looks better the more it refuses: only the
+// attempts it lets in count for its latency, and those it refuses return at
+// once and leave nothing in flight. A refusal counts as a latency of
+// refusalLatencyFactor limits: more than an attempt that was let in, which
+// waited for the limit at most before it ran. That holds as long as running
+// the request takes less than the limit; a request that takes longer counts
+// more when it is answered than when it is refused. A refusal says nothing
+// about whether the replica fails: the count of failures in a row stays as it
+// is.
+func (s *replicaStats) refuse(now time.Time, limit, decay time.Duration) {
+	failures := s.failures
+	s.succeed(now, refusalLatencyFactor*limit, decay)
+	s.failures = failures
+}
+
+// failing tells whether the latest attempts on the replica all failed:
+// failuresBeforePenalty of them in a row, the last one within the decay time.
+func (s *replicaStats) failing(now time.Time, decay time.Duration) bool {
+	return s.failures >= failuresBeforePenalty && now.Sub(s.penaltyAt) <= decay
+}
+
 // fail records a failed attempt: an error, a timeout of its request, or being
 // overtaken by a hedge. Like consecutive-failure outlier detection
 // (Envoy consecutive_5xx, Finagle failure accrual), failures only count

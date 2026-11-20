@@ -27,6 +27,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 )
 
 func TestClassifyAttempt(t *testing.T) {
@@ -52,6 +53,8 @@ func TestClassifyAttempt(t *testing.T) {
 		{"wrapped superseded", withDeadline, now, errors.Wrap(ErrAttemptSuperseded, "search"), attemptSucceeded, 2 * time.Millisecond},
 		{"input error", withDeadline, now, merr.WrapErrParameterInvalidMsg("bad"), attemptIgnored, 0},
 		{"input error through a status", withDeadline, now, merr.Error(merr.Status(merr.WrapErrParameterInvalidMsg("bad"))), attemptIgnored, 0},
+		{"overloaded replica", withDeadline, now, merr.WrapErrTooManyRequests(200, "queue"), attemptIgnored, 0},
+		{"overloaded replica through a status", withDeadline, now, merr.Error(merr.Status(merr.WrapErrTooManyRequests(200, "queue"))), attemptIgnored, 0},
 		{"caller canceled", canceled, now, context.Canceled, attemptIgnored, 0},
 		{"caller canceled mid rpc", canceled, now, status.Error(codes.Canceled, "context canceled"), attemptIgnored, 0},
 		// a failure counts as the attempt's timeout
@@ -78,4 +81,30 @@ func TestClassifyAttempt(t *testing.T) {
 	// the penalty is bounded
 	_, latency := classifyAttempt(context.Background(), start, start.Add(1000*time.Hour), merr.ErrServiceUnavailable)
 	assert.Equal(t, maxAttemptPenalty, latency)
+}
+
+// With the queue wait limit of the QueryNodes configured, a refusal counts
+// with that limit: a tenth of the time the attempt had left, at most 1s.
+func TestClassifyRefusedAttempt(t *testing.T) {
+	paramtable.Init()
+	pt := paramtable.Get()
+	pt.Save(pt.QueryNodeCfg.MaxQueueWaitRatio.Key, "0.1")
+	defer pt.Reset(pt.QueryNodeCfg.MaxQueueWaitRatio.Key)
+
+	start := time.Now()
+	refusal := merr.Error(merr.Status(merr.WrapErrTooManyRequests(200, "queue")))
+	ctx, cancel := context.WithDeadline(context.Background(), start.Add(2*time.Second))
+	defer cancel()
+	outcome, latency := classifyAttempt(ctx, start, start.Add(5*time.Millisecond), refusal)
+	assert.Equal(t, attemptRefused, outcome)
+	assert.Equal(t, 200*time.Millisecond, latency)
+
+	// without a deadline, and with a long one, the limit is maxQueueWait
+	outcome, latency = classifyAttempt(context.Background(), start, start.Add(5*time.Millisecond), refusal)
+	assert.Equal(t, attemptRefused, outcome)
+	assert.Equal(t, time.Second, latency)
+	long, cancelLong := context.WithDeadline(context.Background(), start.Add(time.Minute))
+	defer cancelLong()
+	_, latency = classifyAttempt(long, start, start.Add(5*time.Millisecond), refusal)
+	assert.Equal(t, time.Second, latency)
 }

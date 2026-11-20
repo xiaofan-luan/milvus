@@ -143,7 +143,11 @@ func (lb *LBPolicyImpl) selectCandidate(ctx context.Context, balancer LBBalancer
 	}
 	var targetNodeID int64
 	if lw != nil {
-		targetNodeID, err = lw.SelectNodeForKey(ctx, statsKey(workload), nodes)
+		if workload.bestReplica {
+			targetNodeID, err = lw.SelectBestNodeForKey(ctx, statsKey(workload), nodes)
+		} else {
+			targetNodeID, err = lw.SelectNodeForKey(ctx, statsKey(workload), nodes)
+		}
 	} else {
 		targetNodeID, err = balancer.SelectNode(ctx, nodes, workload.Nq)
 	}
@@ -164,9 +168,9 @@ func (lb *LBPolicyImpl) selectCandidate(ctx context.Context, balancer LBBalancer
 func (lb *LBPolicyImpl) executeWeightedWithRetry(ctx context.Context, workload ChannelWorkload, balancer LBBalancer, lw *LatencyWeightedBalancer) error {
 	excludeNodes := typeutil.NewUniqueSet()
 	var lastErr error
-	hedgedOnce := false
-	tryExecute := func() (bool, error) {
-		node, selected, err := lb.selectNodeWithPolicy(ctx, balancer, lw, workload, &excludeNodes)
+	var refused refusal
+	tryOnce := func() (bool, error) {
+		node, selected, err := lb.selectNodeWithPolicy(ctx, balancer, lw, refused.target(workload), &excludeNodes)
 		if err != nil {
 			// Preserve the existing scoped retry contract when a group's last
 			// leader disappears after an execution error.
@@ -177,14 +181,17 @@ func (lb *LBPolicyImpl) executeWeightedWithRetry(ctx context.Context, workload C
 			return true, err
 		}
 		start := time.Now()
-		if workload.Hedgeable && !hedgedOnce {
+		if workload.Hedgeable && !refused.extraUsed {
 			if delay, enabled := lb.hedging.HedgeDelay(hedgeStatsKey(workload)); enabled {
 				again, hedged, err := lb.executeHedged(ctx, workload, balancer, lw, node, selected, start, delay, nil, &excludeNodes)
 				if hedged {
-					hedgedOnce = true
+					refused.extraUsed = true
 				}
 				if err != nil {
 					lastErr = err
+					if isOverloadErr(err) {
+						refused.err, refused.last, refused.node = err, true, node.NodeID
+					}
 				}
 				return again, err
 			}
@@ -200,11 +207,15 @@ func (lb *LBPolicyImpl) executeWeightedWithRetry(ctx context.Context, workload C
 			}
 			excludeNodes.Insert(node.NodeID)
 			lastErr = merr.Wrapf(err, "failed to search/query delegator %d for channel %s", node.NodeID, workload.Channel)
+			if isOverloadErr(err) {
+				refused.err, refused.last, refused.node = lastErr, true, node.NodeID
+			}
 			return true, lastErr
 		}
 		lb.hedging.ObserveRequest(hedgeStatsKey(workload), time.Since(start))
 		return true, nil
 	}
+	tryExecute := lb.withExtraAttempt(ctx, workload, lw, &refused, func() *typeutil.UniqueSet { return &excludeNodes }, tryOnce)
 	leaders, err := lb.GetShard(ctx, workload.Db, workload.CollectionName, workload.CollectionID, workload.Channel, true)
 	if err != nil {
 		return err

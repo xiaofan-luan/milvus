@@ -205,3 +205,126 @@ all attempts fail. Heartbeat lifecycle tests exercise registration, the failure
 threshold, cleanup, rediscovery, and recovery without manually seeding health
 records. RPC outcomes are controlled in tests; no distributed configuration
 rollout or snapshot-divergence reproduction is claimed.
+
+## Overload protection
+
+Replica selection and hedging route around a replica that is slow or down.
+They do nothing for a request that already waits in a QueryNode read queue,
+and under load above what the replicas get done every request waits there:
+the queue is limited by task count (`queryNode.scheduler.unsolvedQueueSize`),
+which says nothing about time, so the whole excess becomes queue time. Every
+request gets slow, most run into their timeout, and the work done for them is
+thrown away: with one of three replicas down and the others overloaded, 1% to
+2% of the requests were answered (see Measurements).
+
+**Queue wait limit.** `queryNode.scheduler.maxQueueWaitRatio` (default `0`,
+off; intended `0.1`) limits how long a read task may wait in the read queue:
+
+```
+limit = min(maxQueueWait, maxQueueWaitRatio * time left until the deadline)
+```
+
+`queryNode.scheduler.maxQueueWait` defaults to `1s` and is also the limit of a
+task without a deadline. A new task is judged by how long the task that leaves
+the queue next has waited so far, a measured time: when that is more than half
+of the new task's limit, the new task is refused at once with
+`ErrServiceTooManyRequests`. A task that waited longer than its limit after
+all is refused when it leaves the queue. A task whose deadline has passed
+fails as expired, not as refused. The limit applies to every scheduling
+policy, and to the tasks a streaming node runs for growing data, which go
+through the same scheduler. The delegator stage itself (waiting for tsafe,
+fan out, reduce) has no queue and is not covered.
+
+**Not retriable inside Milvus.** `ErrServiceTooManyRequests` was a retriable
+error, which the gRPC client of a component sends again, up to 10 times with
+backoff. It is now not retriable: no component sends a refused request again,
+on any path. This also holds for the other places that return this error (a
+read queue full by task count, the per-user limit, the task queues and the
+REST admission of the Proxy). A replica that refuses is not put on the
+channel blacklist either, which a non-retriable error otherwise does: it
+works, and is left out for the one request only. The client gets code 4 and
+may send the request again; the server does not do it for the client.
+
+**One extra attempt.** A search or query gets one extra attempt on another
+replica, and one only. It is used by whichever comes first: the first replica
+refuses the attempt (the extra attempt takes its place at once, without the
+retry interval), or the hedge delay passes (the extra attempt is the hedge).
+When the extra attempt is refused too, the request ends with the refusal. A
+replica that fails otherwise (it is down, the connection breaks) does not use
+up the extra attempt: the request moves on as before. This holds under every
+replica selection policy.
+
+Under `latency_weighted`, where the Proxy knows how the replicas do:
+
+- the extra attempt goes to the best replica that is left, by the measure the
+  shares are made of (latency times attempts in flight), not to one drawn by
+  share;
+- it goes there only if that replica is better than the one that refused,
+  which counts with the latency of a refusal at least (below). When the
+  replica that refused is still the best there is, the others would take
+  longer or refuse as well, and the request ends at once;
+- a replica whose latest attempts all failed (three in a row, the last within
+  the decay time) is not asked: the request would end with the failure of
+  that replica, after the time it takes to fail, instead of the refusal.
+
+**A refusal counts as latency, not as a failure.** A refusal says that the
+replica has more work than it gets done, not that it fails: counted as a
+failure, its penalty (the request timeout) would move all the traffic to the
+other replicas and overload them in turn. Left out of the statistics, a
+refusal makes the replica look better the more it refuses: only the attempts
+it lets in count, and a refused attempt returns within milliseconds and leaves
+nothing in flight. A refusal is recorded as a latency sample of two queue wait
+limits: more than an attempt that was let in, which waited for the limit at
+most before it ran. The Proxy computes the limit as the QueryNode does, from
+the same two settings. This holds as long as running the request takes less
+than the limit; a request that takes longer counts more when it is answered
+than when it is refused.
+
+**A failing replica gets the minimum share.** A replica whose latest attempts
+all failed gets `minShare` only, as long as another replica answers. Its
+penalty alone does not keep the traffic away when the other replicas are
+loaded: they have a queue of attempts in flight, while its attempts fail at
+once and leave nothing in flight, which the share formula takes for spare
+capacity. Measured without this rule, a dead replica got 12% to 24% of the
+channel requests while the other two were overloaded.
+
+**A failed shard stops the others.** A request over several shards fails with
+its first failed shard; the attempts on the other shards are canceled then.
+
+### Measurements
+
+Three replicas, each one streaming node and one 2-core QueryNode, on a shared
+and noisy host; one replica gets about 40 searches per second done. Open-loop
+search load, 2s timeout, hedging on. "This" is `maxQueueWaitRatio` `0.1`,
+three runs; "before" is the same build without the changes of this section,
+two runs. The fault is a power loss of the QueryNode of one replica.
+
+| Case | This: answered, p50 | Before: answered, p50 |
+|---|---|---|
+| 50/s, no fault | 100%, 0.03s, shares 35/32/33% | 100%, 0.03s |
+| 170/s, no fault | 72% to 73%, 0.21s | 79% to 89%, 4s |
+| 170/s plus 1.5 slow requests per second | normal 52% to 60%, 0.21s; slow 52% to 59% | normal 57% to 60%, 5.8s; slow 11% to 13% |
+| 50/s, one replica down | 100% but for 2 requests in one run | 100% |
+| 120/s, one replica down, 3s to 20s | 68% to 71%, 0.21s | 38% to 41%, 1.7s |
+| 120/s, one replica down, 20s to 40s | 70% to 71%, 0.21s | 1% to 2% |
+
+Refused requests return after about 0.02s. In the overload row without fault
+"before" answers more: it refuses nothing, and deep queues let the QueryNode
+merge more searches into one execution; the load generator also holds back
+requests above 256 in flight, which favors it. These runs were made before
+the last two rules of the list above (the comparison with the replica that
+refused, and its use of the latency of a refusal) were final.
+
+Known limits:
+
+- In the 20s after a fault, until the coordinator takes the dead node out,
+  the replica that lost it is not served; the capacity of the others bounds
+  what is answered. In the first 3s some requests wait for the dead node until
+  their timeout.
+- When a node dies, segments it held are loaded on the nodes that are left,
+  which takes CPU from their queries for a moment: with the limit on, some
+  requests are refused then that would only have been slow without it.
+- Not measured: requests with different timeouts in one queue, Strong
+  consistency under overload, the limit under the other replica selection
+  policies, a streaming node (delegator) lost under overload with three
+  replicas, a replica that is slow but not down.

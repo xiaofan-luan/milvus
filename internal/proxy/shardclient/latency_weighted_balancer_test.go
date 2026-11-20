@@ -480,3 +480,72 @@ func TestLatencyWeightedRediscoveryAfterHealthyHeartbeat(t *testing.T) {
 		})
 	}
 }
+
+func TestSelectBestNodeForKey(t *testing.T) {
+	paramtable.Init()
+	b := NewLatencyWeightedBalancer(NewMockShardClientManager(t))
+	key := "ch|search/Bounded"
+	for i := 0; i < 50; i++ {
+		b.ObserveAttempt(context.Background(), key, 1, false, time.Now().Add(-25*time.Millisecond), nil)
+		b.ObserveAttempt(context.Background(), key, 2, false, time.Now().Add(-10*time.Millisecond), nil)
+		b.ObserveAttempt(context.Background(), key, 3, false, time.Now().Add(-60*time.Millisecond), nil)
+	}
+	// The fastest replica, as long as it has little in flight ...
+	node, err := b.SelectBestNodeForKey(context.Background(), key, []int64{1, 2, 3})
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, node)
+	// ... and the one that is fastest for what it has in flight after that:
+	// replica 2 at 10ms counts as 20ms with one in flight and as 30ms with
+	// two, replica 1 as 25ms.
+	node, err = b.SelectBestNodeForKey(context.Background(), key, []int64{1, 2, 3})
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, node)
+	node, err = b.SelectBestNodeForKey(context.Background(), key, []int64{1, 2, 3})
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, node)
+	// Only among the nodes it is given.
+	node, err = b.SelectBestNodeForKey(context.Background(), key, []int64{3})
+	require.NoError(t, err)
+	assert.EqualValues(t, 3, node)
+	b.ReleaseSelection(key, 2)
+	b.ReleaseSelection(key, 2)
+	b.ReleaseSelection(key, 1)
+	b.ReleaseSelection(key, 3)
+}
+
+// A replica whose latest attempts all failed gets the minimum share only,
+// however loaded the replicas that answer are.
+func TestFailingReplicaGetsMinimumShare(t *testing.T) {
+	paramtable.Init()
+	b := NewLatencyWeightedBalancer(NewMockShardClientManager(t))
+	key := "ch|search/Bounded"
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for i := 0; i < 50; i++ {
+		b.ObserveAttempt(context.Background(), key, 1, false, time.Now().Add(-200*time.Millisecond), nil)
+		b.ObserveAttempt(context.Background(), key, 2, false, time.Now().Add(-200*time.Millisecond), nil)
+	}
+	for i := 0; i < failuresBeforePenalty; i++ {
+		b.ObserveAttempt(ctx, key, 3, false, time.Now(), merr.ErrServiceUnavailable)
+	}
+	// The replicas that answer have a queue: 40 attempts in flight each.
+	b.mu.Lock()
+	b.replicaLocked(key, 1).inflight = 40
+	b.replicaLocked(key, 2).inflight = 40
+	shares := b.sharesLocked(time.Now(), key, []int64{1, 2, 3}, loadLatencyConfig())
+	b.mu.Unlock()
+	assert.InDelta(t, loadLatencyConfig().minShare, shares[2], 1e-9)
+	assert.InDelta(t, shares[0], shares[1], 0.05)
+
+	// When no replica answers, the shares are by the formula again.
+	for i := 0; i < failuresBeforePenalty; i++ {
+		b.ObserveAttempt(ctx, key, 1, false, time.Now(), merr.ErrServiceUnavailable)
+		b.ObserveAttempt(ctx, key, 2, false, time.Now(), merr.ErrServiceUnavailable)
+	}
+	b.mu.Lock()
+	shares = b.sharesLocked(time.Now(), key, []int64{1, 2, 3}, loadLatencyConfig())
+	b.replicaLocked(key, 1).inflight = 0
+	b.replicaLocked(key, 2).inflight = 0
+	b.mu.Unlock()
+	assert.Greater(t, shares[2], 0.5)
+}

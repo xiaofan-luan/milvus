@@ -129,6 +129,9 @@ type hedgeLookupResult struct {
 // keep the outer request context: canceling one earlier can affect other reads
 // merged into its QueryNode task. Only the candidate lookup has a round-local
 // context, so it cannot delay a primary result or outlive a completed round.
+// It returns like a retry.Handle function, whether to keep retrying and the
+// error, and whether a hedge was sent: the request gets one extra attempt at
+// most, see ChannelWorkload.Hedgeable.
 func (lb *LBPolicyImpl) executeHedged(ctx context.Context, workload ChannelWorkload, balancer LBBalancer, lw *LatencyWeightedBalancer,
 	primary NodeInfo, primarySelected bool, primaryStart time.Time, delay time.Duration, requestExcludedNodes, excludeNodes *typeutil.UniqueSet,
 ) (bool, bool, error) {
@@ -180,6 +183,11 @@ func (lb *LBPolicyImpl) executeHedged(ctx context.Context, workload ChannelWorkl
 	}
 	var lastErr error
 	var inputErr error
+	// overloadErr is the refusal of an overloaded replica, when one of the
+	// attempts met one. The round reports it rather than what another attempt
+	// failed with: the retry loop ends the request on it once no replica is
+	// left.
+	var overloadErr error
 	for {
 		select {
 		case <-ctx.Done():
@@ -265,18 +273,26 @@ func (lb *LBPolicyImpl) executeHedged(ctx context.Context, workload ChannelWorkl
 			} else {
 				excludeNodes.Insert(r.node)
 				if lw == nil && !errors.Is(ctx.Err(), context.Canceled) {
-					if r.getClientErr || !merr.IsRetryableErr(r.err) {
+					// A replica that refuses the request as overloaded works:
+					// it is left out for this request only, never blacklisted.
+					if !isOverloadErr(r.err) && (r.getClientErr || !merr.IsRetryableErr(r.err)) {
 						lb.blacklist.Add(workload.Channel, r.node)
 					} else if requestExcludedNodes != nil {
 						requestExcludedNodes.Insert(r.node)
 					}
 				}
 				lastErr = merr.Wrapf(r.err, "failed to search/query delegator %d for channel %s", r.node, workload.Channel)
+				if isOverloadErr(r.err) {
+					overloadErr = lastErr
+				}
 			}
 			if pending == 0 {
 				settle(false)
 				if inputErr != nil {
 					return false, hedgeNode >= 0, inputErr
+				}
+				if overloadErr != nil {
+					return true, hedgeNode >= 0, overloadErr
 				}
 				return true, hedgeNode >= 0, lastErr
 			}

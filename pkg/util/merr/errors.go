@@ -56,10 +56,15 @@ func (err ErrorType) String() string {
 // Name: Err + related prefix + error name
 var (
 	// Service related
-	ErrServiceNotReady             = newMilvusError("service not ready", 1, true) // This indicates the service is still in init
-	ErrServiceUnavailable          = newMilvusError("service unavailable", 2, true)
-	ErrServiceMemoryLimitExceeded  = newMilvusError("memory limit exceeded", 3, false)
-	ErrServiceTooManyRequests      = newMilvusError("too many concurrent requests, queue is full", 4, true)
+	ErrServiceNotReady            = newMilvusError("service not ready", 1, true) // This indicates the service is still in init
+	ErrServiceUnavailable         = newMilvusError("service unavailable", 2, true)
+	ErrServiceMemoryLimitExceeded = newMilvusError("memory limit exceeded", 3, false)
+	// ErrServiceTooManyRequests is the refusal of a node that has more work
+	// than it gets done. It is not retriable inside Milvus: a component that
+	// sent the request again would add to the load that caused the refusal,
+	// and keep its caller waiting for a request that is to fail fast. The
+	// client may send the request again.
+	ErrServiceTooManyRequests      = newMilvusError("too many concurrent requests, queue is full", 4, false)
 	ErrServiceInternal             = newMilvusError("service internal error", 5, false) // Never return this error out of Milvus
 	ErrServiceCrossClusterRouting  = newMilvusError("cross cluster routing", 6, false)
 	ErrServiceDiskLimitExceeded    = newMilvusError("disk limit exceeded", 7, false)

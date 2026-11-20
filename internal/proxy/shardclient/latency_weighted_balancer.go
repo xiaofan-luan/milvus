@@ -175,6 +175,8 @@ func (b *LatencyWeightedBalancer) sharesLocked(now time.Time, key string, candid
 	latencies := make([]time.Duration, n)
 	known := make([]bool, n)
 	inflight := make([]int, n)
+	failing := make([]bool, n)
+	failingCount := 0
 	var knownSum time.Duration
 	knownCount := 0
 	for i, node := range candidates {
@@ -183,6 +185,9 @@ func (b *LatencyWeightedBalancer) sharesLocked(now time.Time, key string, candid
 			continue
 		}
 		inflight[i] = s.inflight
+		if failing[i] = s.failing(now, cfg.decay); failing[i] {
+			failingCount++
+		}
 		if latencies[i], known[i] = s.latency(now, cfg.decay); known[i] {
 			knownSum += latencies[i]
 			knownCount++
@@ -202,6 +207,16 @@ func (b *LatencyWeightedBalancer) sharesLocked(now time.Time, key string, candid
 			latency = replicaMinLatency
 		}
 		shares[i] = 1 / (latency.Seconds() * float64(inflight[i]+1))
+		// A replica whose latest attempts all failed gets the minimum share
+		// only, as long as another replica answers. Its penalty alone does
+		// not keep the traffic away when the other replicas are loaded: they
+		// have a queue of attempts in flight, while its attempts fail at
+		// once and leave nothing in flight, which the formula takes for
+		// spare capacity. The minimum share is what finds out that it is
+		// back.
+		if failing[i] && failingCount < n {
+			shares[i] = 0
+		}
 		total += shares[i]
 	}
 	floor := cfg.minShare
@@ -218,6 +233,21 @@ func (b *LatencyWeightedBalancer) sharesLocked(now time.Time, key string, candid
 // selection counts as in flight until ObserveAttempt (selected) or
 // ReleaseSelection.
 func (b *LatencyWeightedBalancer) SelectNodeForKey(ctx context.Context, key string, availableNodes []int64) (int64, error) {
+	return b.selectNodeForKey(key, availableNodes, false)
+}
+
+// SelectBestNodeForKey selects the node with the largest share for key: the
+// one that is fastest for what it has in flight. It is for the one extra
+// attempt of a request that a replica refused as overloaded: the attempt is
+// the last one, so it goes where it is most likely to be answered, not to a
+// replica drawn by share. The node counts as in flight like one selected by
+// SelectNodeForKey, so that the requests refused in the same moment do not
+// all go to one replica.
+func (b *LatencyWeightedBalancer) SelectBestNodeForKey(ctx context.Context, key string, availableNodes []int64) (int64, error) {
+	return b.selectNodeForKey(key, availableNodes, true)
+}
+
+func (b *LatencyWeightedBalancer) selectNodeForKey(key string, availableNodes []int64, best bool) (int64, error) {
 	candidates := make([]int64, 0, len(availableNodes))
 	for _, node := range availableNodes {
 		m, ok := b.metricsMap.Get(node)
@@ -245,13 +275,24 @@ func (b *LatencyWeightedBalancer) SelectNodeForKey(ctx context.Context, key stri
 	defer b.mu.Unlock()
 	shares := b.sharesLocked(now, key, candidates, cfg)
 	target := candidates[len(candidates)-1]
-	r := b.rng.Float64()
-	for i, share := range shares {
-		if r < share {
-			target = candidates[i]
-			break
+	if best {
+		// start anywhere, so that equal shares do not always give the same node
+		first := b.rng.Intn(len(candidates))
+		target = candidates[first]
+		for i, share := range shares {
+			if share > shares[first] {
+				first, target = i, candidates[i]
+			}
 		}
-		r -= share
+	} else {
+		r := b.rng.Float64()
+		for i, share := range shares {
+			if r < share {
+				target = candidates[i]
+				break
+			}
+			r -= share
+		}
 	}
 	s := b.replicaLocked(key, target)
 	s.begin()
@@ -289,6 +330,8 @@ func (b *LatencyWeightedBalancer) observeAttempt(ctx context.Context, key string
 	switch outcome {
 	case attemptSucceeded:
 		s.succeed(now, latency, cfg.decay)
+	case attemptRefused:
+		s.refuse(now, latency, cfg.decay)
 	case attemptFailed:
 		penalized = s.fail(now, latency, cfg.decay)
 	}
@@ -300,6 +343,48 @@ func (b *LatencyWeightedBalancer) observeAttempt(ctx context.Context, key string
 			mlog.Duration("penalty", latency),
 			mlog.Err(err))
 	}
+}
+
+// BetterThanAll tells whether node is better for key than every one of others:
+// faster for what it has in flight, by the same measure the shares are made
+// of. A request that node refused as overloaded then has nowhere better to
+// go. atLeast is the least latency node counts with: it has just refused a
+// request, so whatever its mean says, a request waits there for longer than
+// it may right now. Without it the comparison of two replicas that are
+// equally fast is decided by noise, and a replica that stalls for a moment
+// while the others are idle ends half of the requests it refuses.
+func (b *LatencyWeightedBalancer) BetterThanAll(key string, node int64, atLeast time.Duration, others []int64) bool {
+	cfg := loadLatencyConfig()
+	now := b.now()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	shares := b.sharesLocked(now, key, append([]int64{node}, others...), cfg)
+	own := shares[0]
+	if s, ok := b.replicas[replicaKey{key, node}]; ok {
+		if latency, known := s.latency(now, cfg.decay); known && latency < atLeast {
+			// a share is in inverse proportion to the latency, but for the
+			// minimum share, which is the same for every replica
+			own = cfg.minShare + (own-cfg.minShare)*latency.Seconds()/atLeast.Seconds()
+		}
+	}
+	for _, share := range shares[1:] {
+		if share >= own {
+			return false
+		}
+	}
+	return true
+}
+
+// Failing tells whether the latest attempts of key on node all failed (see
+// replicaStats.failing): the replica is to be left out when a request has a
+// single attempt left.
+func (b *LatencyWeightedBalancer) Failing(key string, node int64) bool {
+	cfg := loadLatencyConfig()
+	now := b.now()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s, ok := b.replicas[replicaKey{key, node}]
+	return ok && s.failing(now, cfg.decay)
 }
 
 // ObserveOvertaken records negative feedback while the primary is unfinished

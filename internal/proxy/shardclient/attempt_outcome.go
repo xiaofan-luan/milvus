@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/errors"
 
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 )
 
 type attemptOutcome int
@@ -33,6 +34,10 @@ const (
 	// attemptFailed counts against the replica, within the attempt's request
 	// class, once several attempts in a row failed (see replicaStats.fail).
 	attemptFailed
+	// attemptRefused is a replica refusing the attempt as overloaded. It
+	// counts as a latency of the replica, not as a failure (see
+	// replicaStats.refuse).
+	attemptRefused
 )
 
 const (
@@ -50,6 +55,10 @@ const (
 //   - success, or ErrAttemptSuperseded (it succeeded after another attempt of
 //     the channel had already published): succeeded, with its elapsed time.
 //   - an input error: ignored, the request itself is at fault.
+//   - a refusal of an overloaded replica (see isOverloadErr): refused, with
+//     how long the attempt was allowed to wait in the read queue of a node
+//     (queryNodeConfig.ReadQueueWaitLimit, by the time the attempt had left
+//     when it started). Ignored when there is no such limit.
 //   - the attempt's context was canceled: ignored. The caller stopped
 //     waiting, or the request returned with another attempt's result.
 //   - any other error, a timeout of the request included: failed, with a
@@ -70,10 +79,25 @@ func classifyAttempt(ctx context.Context, start, now time.Time, err error) (atte
 	if merr.GetErrorType(err) == merr.InputError {
 		return attemptIgnored, 0
 	}
+	if isOverloadErr(err) {
+		deadline, ok := ctx.Deadline()
+		if limit := paramtable.Get().QueryNodeCfg.ReadQueueWaitLimit(deadline.Sub(start), ok); limit > 0 {
+			return attemptRefused, limit
+		}
+		return attemptIgnored, 0
+	}
 	if errors.Is(ctx.Err(), context.Canceled) {
 		return attemptIgnored, 0
 	}
 	return attemptFailed, attemptTimeout(ctx, start, elapsed)
+}
+
+// isOverloadErr tells whether err is a replica refusing a request because its
+// read queue is too long. It says the replica has more work than it gets
+// done, not that it is failing: the request moves to another replica, and the
+// refusal counts as a latency of this one, not as a failure.
+func isOverloadErr(err error) bool {
+	return errors.Is(err, merr.ErrServiceTooManyRequests)
 }
 
 // attemptTimeout returns how long the request was willing to wait for an

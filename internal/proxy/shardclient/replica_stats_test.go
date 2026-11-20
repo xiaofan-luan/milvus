@@ -116,3 +116,45 @@ func TestReplicaStatsInflight(t *testing.T) {
 	s.end()
 	assert.Equal(t, 1, s.inflight)
 }
+
+func TestReplicaStatsRefuse(t *testing.T) {
+	now := time.Now()
+	decay := 10 * time.Second
+	limit := 200 * time.Millisecond
+	mean := func(s *replicaStats) time.Duration {
+		m, ok := s.mean(now, decay)
+		require.True(t, ok)
+		return m
+	}
+	// A refusal counts as two limits: with every other attempt refused, the
+	// mean is halfway between the latency of the attempts let in and that.
+	var half replicaStats
+	for i := 0; i < 10; i++ {
+		half.succeed(now, 50*time.Millisecond, decay)
+		half.refuse(now, limit, decay)
+	}
+	assert.InDelta(t, 225, mean(&half).Milliseconds(), 1)
+
+	// The first thing known about a replica may be a refusal.
+	var fresh replicaStats
+	fresh.refuse(now, limit, decay)
+	assert.Equal(t, 2*limit, mean(&fresh))
+
+	// A refusal is neither a failure nor a success of the replica.
+	var s replicaStats
+	s.succeed(now, 50*time.Millisecond, decay)
+	s.fail(now, time.Second, decay)
+	s.fail(now, time.Second, decay)
+	s.refuse(now, limit, decay)
+	assert.Equal(t, 2, s.failures)
+	assert.False(t, s.failing(now, decay))
+	s.fail(now, time.Second, decay)
+	assert.True(t, s.failing(now, decay))
+	s.refuse(now, limit, decay)
+	assert.True(t, s.failing(now, decay))
+	// The failures are forgotten with the penalty ...
+	assert.False(t, s.failing(now.Add(2*decay), decay))
+	// ... or with the next attempt that succeeds.
+	s.succeed(now, 50*time.Millisecond, decay)
+	assert.False(t, s.failing(now, decay))
+}

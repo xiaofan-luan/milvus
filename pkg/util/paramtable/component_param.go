@@ -4312,6 +4312,8 @@ type queryNodeConfig struct {
 	ChunkCacheWarmingUp ParamItem `refreshable:"true"`
 
 	MaxUnsolvedQueueSize  ParamItem `refreshable:"true"`
+	MaxQueueWaitRatio     ParamItem `refreshable:"true"`
+	MaxQueueWait          ParamItem `refreshable:"true"`
 	MaxReadConcurrency    ParamItem `refreshable:"true"`
 	MaxGpuReadConcurrency ParamItem `refreshable:"false"`
 	MaxGroupNQ            ParamItem `refreshable:"true"`
@@ -4445,6 +4447,29 @@ func formatDurationWithMillisecondFallback(v string) string {
 		return v + "ms"
 	}
 	return v
+}
+
+// ReadQueueWaitLimit returns how long a read task may wait in the read queue
+// of a QueryNode: scheduler.maxQueueWaitRatio of the time it has left when it
+// is queued, at most scheduler.maxQueueWait. A task without a deadline gets
+// scheduler.maxQueueWait. Zero means no limit, which is the case when
+// maxQueueWaitRatio is not positive. The QueryNode refuses by it, and the
+// Proxy counts a refusal with it.
+func (p *queryNodeConfig) ReadQueueWaitLimit(timeLeft time.Duration, hasDeadline bool) time.Duration {
+	ratio := p.MaxQueueWaitRatio.GetAsFloat()
+	if ratio <= 0 {
+		return 0
+	}
+	limit := p.MaxQueueWait.GetAsDurationByParse()
+	if hasDeadline {
+		// A task about to expire still gets a positive limit: zero would mean
+		// no limit.
+		byDeadline := max(time.Duration(float64(timeLeft)*ratio), time.Nanosecond)
+		if limit <= 0 || byDeadline < limit {
+			limit = byDeadline
+		}
+	}
+	return max(limit, 0)
 }
 
 func (p *queryNodeConfig) init(base *BaseTable, localStoragePath string) {
@@ -5367,6 +5392,26 @@ Max read concurrency must greater than or equal to 1, and less than or equal to 
 		Export:       true,
 	}
 	p.MaxUnsolvedQueueSize.Init(base.mgr)
+
+	p.MaxQueueWaitRatio = ParamItem{
+		Key:          "queryNode.scheduler.maxQueueWaitRatio",
+		Version:      "3.0.0",
+		DefaultValue: "0",
+		Doc: `The share of the time a read task has left when it is queued that it may wait in the queue.
+A task that would wait longer is refused as too many requests, so that the Proxy can turn to another replica.
+0 disables the limit: a task waits until it is executed or its deadline passes.`,
+		Export: true,
+	}
+	p.MaxQueueWaitRatio.Init(base.mgr)
+
+	p.MaxQueueWait = ParamItem{
+		Key:          "queryNode.scheduler.maxQueueWait",
+		Version:      "3.0.0",
+		DefaultValue: "1s",
+		Doc:          "The longest a read task may wait in the queue when maxQueueWaitRatio is positive, whatever its deadline, and what a task without a deadline may wait. It supports duration strings such as 500ms and 1s.",
+		Export:       true,
+	}
+	p.MaxQueueWait.Init(base.mgr)
 
 	p.MaxGroupNQ = ParamItem{
 		Key:          "queryNode.grouping.maxNQ",

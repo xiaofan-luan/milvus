@@ -50,7 +50,18 @@ type ChannelWorkload struct {
 	PreferredNodeID int64
 	// StatsClass separates latency observations by request kind and consistency.
 	StatsClass string
-	// Hedgeable requires Exec to call CommitAttempt before publishing results.
+	// Hedgeable tells that the request may get one extra attempt on another
+	// replica, and one only: a hedge when its attempt on the first replica is
+	// slow, or an attempt that takes its place when the first replica refuses
+	// it as overloaded. When that attempt is refused too, the request ends
+	// with the refusal. Exec must call CommitAttempt before it publishes a
+	// result, as two attempts of the channel may run at once.
+	//
+	// Without it a refusal ends the request at once. The Proxy sets it for
+	// searches and queries at every consistency level.
+	//
+	// A replica that fails otherwise (it is down, the connection breaks) is
+	// not concerned: the request moves on to the other replicas as before.
 	Hedgeable bool
 	// ResourceGroup, when non-empty, restricts selectNode to the leaders whose
 	// replica lives in that resource group (NodeInfo.ResourceGroup). It scopes
@@ -70,6 +81,10 @@ type ChannelWorkload struct {
 	// ExecuteWithRetry. Setting it explicitly still wins, for a caller that
 	// names a scope the context does not carry.
 	ResourceGroup string
+
+	// bestReplica is set for the extra attempt of a request that a replica
+	// refused as overloaded, see refusal.target.
+	bestReplica bool
 }
 
 type CollectionWorkLoad struct {
@@ -359,6 +374,101 @@ func (lb *LBPolicyImpl) selectNode(ctx context.Context, balancer LBBalancer, wor
 	return targetNode, selectedByBalancer, nil
 }
 
+// refusal is what a channel request knows about replicas that refused it as
+// overloaded, see ChannelWorkload.Hedgeable.
+type refusal struct {
+	// err is the refusal, when an attempt of the request met one
+	err error
+	// last tells whether the last attempt was refused
+	last bool
+	// extraUsed tells that the request has had its one extra attempt
+	extraUsed bool
+	// moved tells that the extra attempt took the place of a refused one
+	moved bool
+	// node is the replica that refused the last attempt
+	node int64
+}
+
+// target returns workload for the next selection of a replica: once the
+// request was refused, it goes to the best replica that is left, see
+// LatencyWeightedBalancer.SelectBestNodeForKey.
+func (r *refusal) target(workload ChannelWorkload) ChannelWorkload {
+	workload.bestReplica = r.moved
+	return workload
+}
+
+// withExtraAttempt makes a retry.Handle function of tryOnce, which runs one
+// attempt and reports a refusal in st. A request refused as overloaded gets
+// its extra attempt at once: the replica that refused it is excluded and
+// there is nothing to wait for, whatever the retry interval. The request ends
+// with the refusal when it may not have an extra attempt, has had it, or no
+// replica is left that is worth it (see replicasForExtraAttempt): it is not
+// tried on a third replica, nor are the shard leaders refreshed to go around
+// again, which would add to the queues that refused it. The client may try
+// again. excluded returns the replicas the request does not go to.
+//
+// Under the latency weighted policy the extra attempt goes to the best
+// replica that is left, and only if that one is better than the replica that
+// refused: when the replica that refused is the best there is, the others
+// would take longer or refuse as well, and the request ends at once. The
+// replica that refused counts with the latency of a refusal at least, see
+// LatencyWeightedBalancer.BetterThanAll.
+func (lb *LBPolicyImpl) withExtraAttempt(ctx context.Context, workload ChannelWorkload, lw *LatencyWeightedBalancer,
+	st *refusal, excluded func() *typeutil.UniqueSet, tryOnce func() (bool, error),
+) func() (bool, error) {
+	return func() (bool, error) {
+		for {
+			st.last = false
+			again, err := tryOnce()
+			if !again || !st.last || ctx.Err() != nil {
+				return again, err
+			}
+			if !workload.Hedgeable || st.extraUsed {
+				return false, st.err
+			}
+			left, known := lb.replicasForExtraAttempt(ctx, workload, lw, excluded())
+			if known && (len(left) == 0 || (lw != nil && lw.BetterThanAll(statsKey(workload), st.node, refusalLatency(ctx), left))) {
+				return false, st.err
+			}
+			st.extraUsed, st.moved = true, true
+		}
+	}
+}
+
+// refusalLatency returns the latency a refusal of a request on ctx counts as
+// now, see replicaStats.refuse. Zero without a queue wait limit.
+func refusalLatency(ctx context.Context) time.Duration {
+	deadline, ok := ctx.Deadline()
+	return refusalLatencyFactor * paramtable.Get().QueryNodeCfg.ReadQueueWaitLimit(time.Until(deadline), ok)
+}
+
+// replicasForExtraAttempt returns the replicas of the channel that are left
+// for the extra attempt of the request, by the cached shard leaders of its
+// resource group, and false when the leaders are not known. A replica whose
+// latest attempts all failed (LatencyWeightedBalancer.Failing, known under
+// that policy only) is not one: the request has a single attempt left, and
+// there it would end with the failure of that replica instead of the
+// refusal. Such replicas are excluded for the request.
+func (lb *LBPolicyImpl) replicasForExtraAttempt(ctx context.Context, workload ChannelWorkload, lw *LatencyWeightedBalancer, excludeNodes *typeutil.UniqueSet) ([]int64, bool) {
+	leaders, err := lb.GetShard(ctx, workload.Db, workload.CollectionName, workload.CollectionID, workload.Channel, true)
+	if err != nil {
+		return nil, false
+	}
+	leaders = FilterByResourceGroup(leaders, workload.ResourceGroup)
+	left := make([]int64, 0, len(leaders))
+	for _, leader := range leaders {
+		if excludeNodes.Contain(leader.NodeID) {
+			continue
+		}
+		if lw != nil && lw.Failing(statsKey(workload), leader.NodeID) {
+			excludeNodes.Insert(leader.NodeID)
+			continue
+		}
+		left = append(left, leader.NodeID)
+	}
+	return left, len(leaders) > 0
+}
+
 // ExecuteWithRetry will choose a qn to execute the workload, and retry if failed, until reach the max retryTimes.
 func (lb *LBPolicyImpl) ExecuteWithRetry(ctx context.Context, workload ChannelWorkload) error {
 	// Extension seam, see resource_group_scope.go: the request's routing scope is
@@ -377,8 +487,8 @@ func (lb *LBPolicyImpl) ExecuteWithRetry(ctx context.Context, workload ChannelWo
 	var err error
 	var shardLeaders []NodeInfo
 	requestExcludedNodes := typeutil.NewUniqueSet()
-	hedgedOnce := false
-	tryExecute := func() (bool, error) {
+	var refused refusal
+	tryOnce := func() (bool, error) {
 		// Get fresh blacklist on each retry to include newly blacklisted nodes
 		blacklist := lb.blacklist.GetBlacklistedNodes(workload.Channel)
 		// The "every leader excluded" recovery is judged on the SCOPED leader
@@ -453,14 +563,17 @@ func (lb *LBPolicyImpl) ExecuteWithRetry(ctx context.Context, workload ChannelWo
 			return true, err
 		}
 		start := time.Now()
-		if workload.Hedgeable && !hedgedOnce {
+		if workload.Hedgeable && !refused.extraUsed {
 			if delay, enabled := lb.hedging.HedgeDelay(hedgeStatsKey(workload)); enabled {
 				again, hedged, err := lb.executeHedged(ctx, workload, balancer, nil, targetNode, selectedByBalancer, start, delay, &requestExcludedNodes, &excludeNodes)
 				if hedged {
-					hedgedOnce = true
+					refused.extraUsed = true
 				}
 				if err != nil {
 					lastErr = err
+					if isOverloadErr(err) {
+						refused.err, refused.last, refused.node = err, true, targetNode.NodeID
+					}
 				}
 				return again, err
 			}
@@ -504,12 +617,17 @@ func (lb *LBPolicyImpl) ExecuteWithRetry(ctx context.Context, workload ChannelWo
 			if merr.GetErrorType(err) == merr.InputError {
 				return false, err
 			}
-			if merr.IsRetryableErr(err) {
+			// A replica that refuses the request as overloaded works: it is
+			// left out for this request only, never blacklisted.
+			if merr.IsRetryableErr(err) || isOverloadErr(err) {
 				requestExcludedNodes.Insert(targetNode.NodeID)
 			} else {
 				lb.blacklist.Add(workload.Channel, targetNode.NodeID)
 			}
 			lastErr = errors.Wrapf(err, "failed to search/query delegator %d for channel %s", targetNode.NodeID, workload.Channel)
+			if isOverloadErr(err) {
+				refused.err, refused.last, refused.node = lastErr, true, targetNode.NodeID
+			}
 			return true, lastErr
 		}
 
@@ -518,6 +636,11 @@ func (lb *LBPolicyImpl) ExecuteWithRetry(ctx context.Context, workload ChannelWo
 		}
 		return true, nil
 	}
+	tryExecute := lb.withExtraAttempt(ctx, workload, nil, &refused, func() *typeutil.UniqueSet {
+		excluded := typeutil.NewUniqueSet(lb.blacklist.GetBlacklistedNodes(workload.Channel)...)
+		excluded.Insert(requestExcludedNodes.Collect()...)
+		return &excluded
+	}, tryOnce)
 
 	shardLeaders, err = lb.GetShard(ctx, workload.Db, workload.CollectionName, workload.CollectionID, workload.Channel, true)
 	if err != nil {
@@ -567,7 +690,10 @@ func (lb *LBPolicyImpl) Execute(ctx context.Context, workload CollectionWorkLoad
 		return lb.ExecuteWithRetry(ctx, workload.ForChannel(channelList[0], preferredNodeID(workload, channelList[0])))
 	}
 
-	wg, _ := errgroup.WithContext(ctx)
+	// The request fails with its first failed channel: stop the work for the
+	// other channels then, rather than finish it for a result nobody gets.
+	wg, ctx := errgroup.WithContext(ctx)
+	// Launch a goroutine for each channel
 	for _, channel := range channelList {
 		wg.Go(func() error {
 			return lb.ExecuteWithRetry(ctx, workload.ForChannel(channel, preferredNodeID(workload, channel)))
